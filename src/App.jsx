@@ -80,7 +80,10 @@ function chaveCache(end) {
   return end.toLowerCase().trim().replace(/\s+/g, " ").replace(/[.,]/g, "");
 }
 
-async function geocodificar(endereco, cache) {
+function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+async function geocodificar(endereco, cache, tentativa) {
+  tentativa = tentativa || 1;
   var k = chaveCache(endereco);
   if (cache[k]) return { ...cache[k], fonte: "cache" };
 
@@ -88,6 +91,11 @@ async function geocodificar(endereco, cache) {
     var resp = await fetch("/api/geocode?address=" + encodeURIComponent(endereco));
     if (!resp.ok) {
       var err = await resp.json().catch(function () { return {}; });
+      // Tenta novamente até 3 vezes em caso de erro temporário
+      if (tentativa < 3) {
+        await delay(500 * tentativa);
+        return await geocodificar(endereco, cache, tentativa + 1);
+      }
       return { erro: err.error || "Erro " + resp.status };
     }
     var data = await resp.json();
@@ -100,6 +108,10 @@ async function geocodificar(endereco, cache) {
     salvarCache(cache);
     return { ...resultado, fonte: "api" };
   } catch (e) {
+    if (tentativa < 3) {
+      await delay(500 * tentativa);
+      return await geocodificar(endereco, cache, tentativa + 1);
+    }
     return { erro: "Falha de rede: " + e.message };
   }
 }
@@ -258,12 +270,14 @@ function linkMaps(reservas) {
 // 4. Concatena tudo + calcula horários a partir do início
 // ============================================================
 async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress) {
-  // 1. Geocodifica todos
+  // 1. Geocodifica todos (em série, com pausa leve entre chamadas)
   var enriquecidos = [];
   for (var i = 0; i < reservas.length; i++) {
     if (onProgress) onProgress("Geocodificando " + (i + 1) + "/" + reservas.length + ": " + reservas[i].endereco);
     var geo = await geocodificar(reservas[i].endereco, cache);
     enriquecidos.push({ ...reservas[i], ...geo });
+    // Pausa curta pra não sobrecarregar a API
+    if (i < reservas.length - 1) await delay(150);
   }
 
   // 2. Separa não geocodificados (vão pro final)
