@@ -323,45 +323,36 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
       return ascendente ? a.lng - b.lng : b.lng - a.lng;
     });
   } else {
-    // Estratégia: testamos múltiplos cenários de origem/destino e escolhemos o de menor tempo.
-    // Isso resolve o caso em que "extremo de longitude" não é o melhor início/fim.
+    // Estratégia: testamos VÁRIOS candidatos de origem/destino (pares de extremos)
+    // e ficamos com o de menor duração total. Se o resultado vier no sentido inverso
+    // ao vetor desejado, invertemos a rota (manter otimizada).
     if (onProgress) onProgress("Otimizando rota (" + ok.length + " paradas) via Google...");
 
     var porLng = ok.slice().sort(function (a, b) { return a.lng - b.lng; });
-    var maisOeste = porLng[0];
-    var maisLeste = porLng[porLng.length - 1];
+    var porLat = ok.slice().sort(function (a, b) { return a.lat - b.lat; });
 
-    // Candidatos de origem/destino - respeitando o sentido do vetor
-    var candidatos = [];
-    if (ascendente) {
-      // Tour para leste: começa no oeste, termina no leste
-      // Candidato 1: começa no mais oeste, termina no mais leste
-      candidatos.push({ entrada: maisOeste, saida: maisLeste });
-      // Candidato 2: começa no mais oeste, termina no segundo mais leste (se houver)
-      if (ok.length >= 4) {
-        candidatos.push({ entrada: maisOeste, saida: porLng[porLng.length - 2] });
-      }
-    } else {
-      // Tour para oeste: começa no leste, termina no oeste
-      candidatos.push({ entrada: maisLeste, saida: maisOeste });
-      if (ok.length >= 4) {
-        candidatos.push({ entrada: maisLeste, saida: porLng[1] });
-      }
-    }
+    // Candidatos de par origem-destino: vários extremos possíveis
+    var paresCandidatos = [
+      [porLng[0], porLng[porLng.length - 1]],                      // mais oeste ↔ mais leste
+      [porLat[0], porLat[porLat.length - 1]],                      // mais sul ↔ mais norte
+      [porLng[0], porLat[porLat.length - 1]],                      // mais oeste ↔ mais norte
+      [porLng[porLng.length - 1], porLat[0]]                       // mais leste ↔ mais sul
+    ];
 
-    // Testa todos os candidatos e pega o de menor duração total
+    // Remove pares inválidos (mesmos pontos)
+    paresCandidatos = paresCandidatos.filter(function (p) { return p[0] !== p[1]; });
+
     var melhorResultado = null;
     var melhorDuracao = Infinity;
 
-    for (var c = 0; c < candidatos.length; c++) {
-      var ent = candidatos[c].entrada;
-      var sai = candidatos[c].saida;
-      if (ent === sai) continue;
-      var meio = ok.filter(function (r) { return r !== ent && r !== sai; });
+    for (var c = 0; c < paresCandidatos.length; c++) {
+      var a = paresCandidatos[c][0];
+      var b = paresCandidatos[c][1];
+      var meio = ok.filter(function (r) { return r !== a && r !== b; });
 
-      var pts = [{ lat: ent.lat, lng: ent.lng }]
+      var pts = [{ lat: a.lat, lng: a.lng }]
         .concat(meio.map(function (r) { return { lat: r.lat, lng: r.lng }; }))
-        .concat([{ lat: sai.lat, lng: sai.lng }]);
+        .concat([{ lat: b.lat, lng: b.lng }]);
 
       var rotaOtim = await otimizarRota(pts);
       if (rotaOtim.erro) continue;
@@ -369,13 +360,17 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
       var duracao = (rotaOtim.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
       if (duracao < melhorDuracao) {
         melhorDuracao = duracao;
-        var todos = [ent].concat(meio).concat([sai]);
+        var todos = [a].concat(meio).concat([b]);
         melhorResultado = rotaOtim.ordem.map(function (i) { return todos[i]; });
       }
     }
 
     if (melhorResultado) {
-      ordenadosFinal = melhorResultado;
+      // Verifica se o sentido bate com o vetor. Se não, inverte.
+      var primeiro = melhorResultado[0];
+      var ultimo = melhorResultado[melhorResultado.length - 1];
+      var sentidoOK = ascendente ? (primeiro.lng <= ultimo.lng) : (primeiro.lng >= ultimo.lng);
+      ordenadosFinal = sentidoOK ? melhorResultado : melhorResultado.slice().reverse();
     } else {
       // Fallback: ordena por longitude
       ordenadosFinal = ok.slice().sort(function (a, b) {
@@ -577,7 +572,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.3 · Google Maps</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.4 · Google Maps</div>
           </div>
         </div>
         <div style={styles.headerRight}>
