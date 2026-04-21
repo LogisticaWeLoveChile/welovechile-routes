@@ -146,22 +146,20 @@ function tempoEstimadoMin(a, b) {
 // ============================================================
 // ROTAS API (otimização real)
 // ============================================================
-async function otimizarRota(pontos) {
+async function otimizarRota(pontos, horarioPartida) {
   if (pontos.length < 2) return { ordem: pontos.map(function (_, i) { return i; }), legs: [] };
 
   try {
     var resp = await fetch("/api/routes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ points: pontos, optimize: true })
+      body: JSON.stringify({ points: pontos, optimize: true, departureTime: horarioPartida })
     });
     if (!resp.ok) {
       var err = await resp.json().catch(function () { return {}; });
       return { erro: err.error || "Routes erro" };
     }
     var data = await resp.json();
-    // optimizedOrder vem só com os intermediários reordenados
-    // Reconstrói a ordem completa: [0, ...optimized+1, last]
     var n = pontos.length;
     var ordem = [0];
     (data.optimizedOrder || []).forEach(function (i) { ordem.push(i + 1); });
@@ -172,13 +170,11 @@ async function otimizarRota(pontos) {
   }
 }
 
-// Routes API aceita máximo de 25 waypoints intermediários.
-// Se uma chamada tem mais pontos que isso, dividimos em pedaços.
 var MAX_PONTOS_POR_CHAMADA = 25;
 
-async function otimizarRotaEmPedacos(pontos) {
+async function otimizarRotaEmPedacos(pontos, horarioPartida) {
   if (pontos.length <= MAX_PONTOS_POR_CHAMADA) {
-    return await otimizarRota(pontos);
+    return await otimizarRota(pontos, horarioPartida);
   }
   var tamanho = MAX_PONTOS_POR_CHAMADA - 1;
   var pedacos = [];
@@ -199,7 +195,7 @@ async function otimizarRotaEmPedacos(pontos) {
       offset += pd.length;
       continue;
     }
-    var r = await otimizarRota(pd);
+    var r = await otimizarRota(pd, horarioPartida);
     if (r.erro) {
       for (var q = 0; q < pd.length; q++) ordemFinal.push(offset + q);
     } else {
@@ -212,6 +208,45 @@ async function otimizarRotaEmPedacos(pontos) {
   }
 
   return { ordem: ordemFinal, legs: legsFinal };
+}
+
+// ============================================================
+// SISTEMA DE PONTUAÇÃO DE ROTAS
+// Avalia quão "boa" é uma rota considerando:
+//  - Duração total (peso maior = menos importante)
+//  - Coerência direcional (quanto cada passo avança na direção certa)
+//  - Penalidade por voltas (longitude/latitude que retrocede)
+// Retorna score - MENOR = MELHOR
+// ============================================================
+function pontuarRota(ordem, duracaoSec, vetor) {
+  if (ordem.length < 2) return duracaoSec;
+  var ascendente = (vetor === "leste" || vetor === "norte" || vetor === "sudeste" || vetor === "nordeste");
+
+  // Coerência direcional: soma dos "retrocessos" de longitude
+  var retrocessos = 0;
+  var avanceTotal = 0;
+  for (var i = 1; i < ordem.length; i++) {
+    var delta = ordem[i].lng - ordem[i - 1].lng;
+    if (ascendente) {
+      if (delta < 0) retrocessos += Math.abs(delta);
+      else avanceTotal += delta;
+    } else {
+      if (delta > 0) retrocessos += Math.abs(delta);
+      else avanceTotal += Math.abs(delta);
+    }
+  }
+
+  // Cada 0.001 de longitude ~= ~90 metros em Santiago
+  // Convertemos retrocesso em "penalidade em segundos": cada 0.001 = +60s
+  var penalidadeRetrocesso = retrocessos * 60000;
+
+  // Verifica se primeiro/último ponto está no sentido certo. Se não, penaliza MUITO.
+  var primeiro = ordem[0];
+  var ultimo = ordem[ordem.length - 1];
+  var sentidoOK = ascendente ? (primeiro.lng <= ultimo.lng) : (primeiro.lng >= ultimo.lng);
+  var penalidadeSentido = sentidoOK ? 0 : duracaoSec * 0.5; // 50% a mais se invertido
+
+  return duracaoSec + penalidadeRetrocesso + penalidadeSentido;
 }
 
 // ============================================================
@@ -403,7 +438,7 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
     paresCandidatos = paresCandidatos.filter(function (p) { return p[0] !== p[1]; });
 
     var melhorResultado = null;
-    var melhorDuracao = Infinity;
+    var melhorScore = Infinity;
 
     for (var c = 0; c < paresCandidatos.length; c++) {
       var a = paresCandidatos[c][0];
@@ -414,25 +449,29 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
         .concat(meio.map(function (r) { return { lat: r.lat, lng: r.lng }; }))
         .concat([{ lat: b.lat, lng: b.lng }]);
 
-      var rotaOtim = await otimizarRotaEmPedacos(pts);
+      var rotaOtim = await otimizarRotaEmPedacos(pts, horarioInicio);
       if (rotaOtim.erro) continue;
 
       var duracao = (rotaOtim.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
-      if (duracao < melhorDuracao) {
-        melhorDuracao = duracao;
-        var todos = [a].concat(meio).concat([b]);
-        melhorResultado = rotaOtim.ordem.map(function (i) { return todos[i]; });
+      var todos = [a].concat(meio).concat([b]);
+      var ordemCandidata = rotaOtim.ordem.map(function (i) { return todos[i]; });
+
+      // Score = duração + penalidade por voltas + penalidade por sentido invertido
+      var score = pontuarRota(ordemCandidata, duracao, vetor);
+
+      if (score < melhorScore) {
+        melhorScore = score;
+        melhorResultado = ordemCandidata;
       }
     }
 
     if (melhorResultado) {
-      // Verifica se o sentido bate com o vetor. Se não, inverte.
+      // Verifica sentido e inverte se necessário (backup caso pontuação não tenha filtrado)
       var primeiro = melhorResultado[0];
       var ultimo = melhorResultado[melhorResultado.length - 1];
       var sentidoOK = ascendente ? (primeiro.lng <= ultimo.lng) : (primeiro.lng >= ultimo.lng);
       ordenadosFinal = sentidoOK ? melhorResultado : melhorResultado.slice().reverse();
     } else {
-      // Fallback: ordena por longitude
       ordenadosFinal = ok.slice().sort(function (a, b) {
         return ascendente ? a.lng - b.lng : b.lng - a.lng;
       });
@@ -453,7 +492,7 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
       try {
         var temposReq = await fetch("/api/routes", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ points: ptsFinal, optimize: false })
+          body: JSON.stringify({ points: ptsFinal, optimize: false, departureTime: horarioInicio })
         });
         if (temposReq.ok) {
           var tempData = await temposReq.json();
@@ -469,7 +508,7 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
         try {
           var rsp = await fetch("/api/routes", {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ points: subPts, optimize: false })
+            body: JSON.stringify({ points: subPts, optimize: false, departureTime: horarioInicio })
           });
           if (rsp.ok) {
             var td = await rsp.json();
@@ -656,7 +695,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.6 · Google Maps</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.7 · Google Maps</div>
           </div>
         </div>
         <div style={styles.headerRight}>
