@@ -90,6 +90,7 @@ export var styles = {
   },
   paradas: { padding: 6 },
   parada: { display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderBottom: "1px solid " + BD, cursor: "grab", userSelect: "none" },
+  paradaDragTarget: { display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderBottom: "1px solid " + AC, cursor: "grab", userSelect: "none", background: "rgba(245,158,11,0.04)" },
   pDrag: { color: BDH, fontFamily: FM, fontSize: 14, cursor: "grab", letterSpacing: "-2px" },
   pNum: { fontFamily: FM, fontSize: 13, fontWeight: 700, color: AC, width: 20, textAlign: "center" },
   pHora: { fontFamily: FM, fontSize: 13, fontWeight: 600, color: TX, minWidth: 48, background: BGD, padding: "4px 8px", border: "1px solid " + BD, borderRadius: 2, textAlign: "center" },
