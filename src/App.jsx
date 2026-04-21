@@ -146,7 +146,8 @@ function tempoEstimadoMin(a, b) {
 // ============================================================
 // ROTAS API (otimização real)
 // ============================================================
-async function otimizarRota(pontos, horarioPartida) {
+async function otimizarRota(pontos, horarioPartida, tentativa) {
+  tentativa = tentativa || 1;
   if (pontos.length < 2) return { ordem: pontos.map(function (_, i) { return i; }), legs: [] };
 
   try {
@@ -157,57 +158,80 @@ async function otimizarRota(pontos, horarioPartida) {
     });
     if (!resp.ok) {
       var err = await resp.json().catch(function () { return {}; });
-      return { erro: err.error || "Routes erro" };
+      // Retry até 3x pra erros temporários
+      if (tentativa < 3 && resp.status >= 500) {
+        if (typeof console !== "undefined") console.warn("Routes retry " + tentativa + "/3:", err.error);
+        await new Promise(function (r) { setTimeout(r, 400 * tentativa); });
+        return await otimizarRota(pontos, horarioPartida, tentativa + 1);
+      }
+      return { erro: err.error || "Routes erro", statusCode: resp.status, details: err.details };
     }
     var data = await resp.json();
     var n = pontos.length;
     var ordem = [0];
     (data.optimizedOrder || []).forEach(function (i) { ordem.push(i + 1); });
     ordem.push(n - 1);
-    return { ordem: ordem, legs: data.legs || [] };
+    return { ordem: ordem, legs: data.legs || [], totalDurationSec: data.totalDurationSec };
   } catch (e) {
+    if (tentativa < 3) {
+      await new Promise(function (r) { setTimeout(r, 400 * tentativa); });
+      return await otimizarRota(pontos, horarioPartida, tentativa + 1);
+    }
     return { erro: e.message };
   }
 }
 
-var MAX_PONTOS_POR_CHAMADA = 25;
+// Routes API: limite 25 intermediários, ou seja MAX 27 pontos total (origem + 25 + destino).
+// Mas por segurança usamos 24 intermediários = 26 pontos max.
+var MAX_PONTOS_POR_CHAMADA = 26;
 
 async function otimizarRotaEmPedacos(pontos, horarioPartida) {
   if (pontos.length <= MAX_PONTOS_POR_CHAMADA) {
     return await otimizarRota(pontos, horarioPartida);
   }
-  var tamanho = MAX_PONTOS_POR_CHAMADA - 1;
+
+  // Rota grande: divide em chunks SOBREPOSTOS (1 ponto de overlap entre pedaços)
+  // Ex: 31 pontos -> chunks [0..25] e [25..30]
+  var avanco = MAX_PONTOS_POR_CHAMADA - 1; // quantos pontos novos cada chunk adiciona
   var pedacos = [];
-  for (var i = 0; i < pontos.length; i += tamanho) {
-    var fim = Math.min(i + tamanho + 1, pontos.length);
-    pedacos.push(pontos.slice(i, fim));
+  for (var i = 0; i < pontos.length - 1; i += avanco) {
+    var fim = Math.min(i + MAX_PONTOS_POR_CHAMADA, pontos.length);
+    pedacos.push({ inicio: i, fim: fim, pontos: pontos.slice(i, fim) });
     if (fim >= pontos.length) break;
+  }
+
+  if (typeof console !== "undefined") {
+    console.log("otimizarEmPedacos: " + pontos.length + " pontos -> " + pedacos.length + " pedaços",
+      pedacos.map(function (p) { return p.inicio + ".." + p.fim + " (" + p.pontos.length + ")"; }));
   }
 
   var ordemFinal = [];
   var legsFinal = [];
-  var offset = 0;
+  var houveErro = false;
 
   for (var p = 0; p < pedacos.length; p++) {
     var pd = pedacos[p];
-    if (pd.length < 2) {
-      ordemFinal.push(offset);
-      offset += pd.length;
+    if (pd.pontos.length < 2) {
+      if (p === 0) ordemFinal.push(pd.inicio);
       continue;
     }
-    var r = await otimizarRota(pd, horarioPartida);
+    var r = await otimizarRota(pd.pontos, horarioPartida);
     if (r.erro) {
-      for (var q = 0; q < pd.length; q++) ordemFinal.push(offset + q);
+      houveErro = true;
+      if (typeof console !== "undefined") console.error("Pedaço " + p + " falhou:", r.erro);
+      // Fallback deste pedaço: mantém ordem original
+      for (var q = 0; q < pd.pontos.length; q++) {
+        if (p === 0 || q > 0) ordemFinal.push(pd.inicio + q);
+      }
     } else {
-      var ordemPedaco = r.ordem.map(function (ix) { return ix + offset; });
-      if (p > 0) ordemPedaco.shift();
+      var ordemPedaco = r.ordem.map(function (ix) { return pd.inicio + ix; });
+      if (p > 0) ordemPedaco.shift(); // remove overlap (é o último do pedaço anterior)
       ordemFinal = ordemFinal.concat(ordemPedaco);
       legsFinal = legsFinal.concat(r.legs || []);
     }
-    offset += pd.length - 1;
   }
 
-  return { ordem: ordemFinal, legs: legsFinal };
+  return { ordem: ordemFinal, legs: legsFinal, houveErro: houveErro };
 }
 
 // ============================================================
@@ -429,7 +453,7 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
     var rotaOtim = await otimizarRotaEmPedacos(pts, horarioInicio);
 
     if (rotaOtim.erro) {
-      if (typeof console !== "undefined") console.warn("Routes erro:", rotaOtim.erro, "- usando fallback por longitude");
+      if (typeof console !== "undefined") console.error("❌ ROUTES API ERRO TOTAL:", rotaOtim.erro, "- usando fallback por longitude");
       ordenadosFinal = ok.slice().sort(function (a, b) {
         return ascendente ? a.lng - b.lng : b.lng - a.lng;
       });
@@ -439,7 +463,13 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
 
       if (typeof console !== "undefined") {
         var duracaoTotal = (rotaOtim.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
-        console.log("RESULTADO do Google (" + Math.round(duracaoTotal / 60) + " min total):");
+        if (rotaOtim.houveErro) {
+          console.warn("⚠️ Parte da rota falhou, resultado misto (otimização parcial):");
+        } else if (duracaoTotal === 0) {
+          console.warn("⚠️ Google retornou duração 0 - pode ser fallback silencioso");
+        } else {
+          console.log("✅ RESULTADO do Google (" + Math.round(duracaoTotal / 60) + " min total):");
+        }
         ordenadosFinal.forEach(function (r, i) {
           console.log("  " + (i + 1) + ". " + r.endereco + " | setor=" + r.setor + " lng=" + r.lng.toFixed(4));
         });
@@ -752,7 +782,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.8 · Debug + Drag Interno</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.9 · Retry + Pedaços corrigidos</div>
           </div>
         </div>
         <div style={styles.headerRight}>
