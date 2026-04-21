@@ -311,67 +311,48 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
   var ok = enriquecidos.filter(function (r) { return r.lat && r.lng; });
   var falhos = enriquecidos.filter(function (r) { return !r.lat; });
 
-  // 3. Agrupa por setor
-  var ordemSetores = direcaoSetores(vetor);
-  var clusters = {};
-  ok.forEach(function (r) {
-    var s = r.setor || 99;
-    if (!clusters[s]) clusters[s] = [];
-    clusters[s].push(r);
-  });
-
-  // 4. Pra cada setor, otimiza a ordem interna via Routes API
-  //    Forçando entrada pelo ponto mais próximo do setor anterior
-  //    e saída pelo ponto mais próximo do próximo setor
   var ordenadosFinal = [];
 
-  var setoresAtivos = ordemSetores.filter(function (s) { return clusters[s] && clusters[s].length > 0; });
-
-  for (var idx = 0; idx < setoresAtivos.length; idx++) {
-    var setor = setoresAtivos[idx];
-    var grupo = clusters[setor];
-
-    // Determina ponto de entrada/saída do cluster pela direção do vetor
-    // Para tours leste/norte/sudeste: entra pelo oeste (lng menor) e sai pelo leste (lng maior)
-    // Para tours oeste/sudoeste/sul: entra pelo leste (lng maior) e sai pelo oeste (lng menor)
+  if (ok.length === 0) {
+    ordenadosFinal = [];
+  } else if (ok.length === 1) {
+    ordenadosFinal = ok;
+  } else if (ok.length === 2) {
+    // 2 pontos: ordena pela direção do vetor
+    var ascendente2 = (vetor === "leste" || vetor === "norte" || vetor === "sudeste" || vetor === "nordeste");
+    ordenadosFinal = ok.slice().sort(function (a, b) {
+      return ascendente2 ? a.lng - b.lng : b.lng - a.lng;
+    });
+  } else {
+    // 3+ pontos: fixa extremos pelo vetor, Google otimiza o meio livremente
     var ascendente = (vetor === "leste" || vetor === "norte" || vetor === "sudeste" || vetor === "nordeste");
 
-    if (grupo.length === 1) {
-      ordenadosFinal.push(grupo[0]);
-      continue;
-    }
+    // Ordena por longitude e pega os extremos
+    var porLng = ok.slice().sort(function (a, b) { return a.lng - b.lng; });
+    var maisOeste = porLng[0];
+    var maisLeste = porLng[porLng.length - 1];
 
-    if (grupo.length === 2) {
-      // Ordena os 2 pontos pela longitude conforme direção
-      var par = grupo.slice().sort(function (a, b) {
-        return ascendente ? a.lng - b.lng : b.lng - a.lng;
-      });
-      ordenadosFinal = ordenadosFinal.concat(par);
-      continue;
-    }
+    // Entrada (primeiro ponto da rota) e saída (último) conforme vetor
+    var entrada = ascendente ? maisOeste : maisLeste;
+    var saida = ascendente ? maisLeste : maisOeste;
+    var meio = ok.filter(function (r) { return r !== entrada && r !== saida; });
 
-    // 3+ pontos: escolhe origem/destino pelo extremo de longitude, otimiza o meio via Routes API
-    var ordenadoPorLng = grupo.slice().sort(function (a, b) {
-      return ascendente ? a.lng - b.lng : b.lng - a.lng;
-    });
-    var entrada = ordenadoPorLng[0];
-    var saida = ordenadoPorLng[ordenadoPorLng.length - 1];
-    var meio = ordenadoPorLng.slice(1, -1);
+    if (onProgress) onProgress("Otimizando rota (" + ok.length + " paradas) via Google...");
 
-    if (onProgress) onProgress("Otimizando " + nomeSetor(setor) + " (" + grupo.length + " paradas)...");
-
+    // Monta pontos: entrada + meio + saida
     var pts = [{ lat: entrada.lat, lng: entrada.lng }]
       .concat(meio.map(function (r) { return { lat: r.lat, lng: r.lng }; }))
       .concat([{ lat: saida.lat, lng: saida.lng }]);
 
     var rotaOtim = await otimizarRota(pts);
     if (rotaOtim.erro) {
-      // Fallback: mantém ordem por longitude
-      ordenadosFinal = ordenadosFinal.concat(ordenadoPorLng);
+      // Fallback: ordena por longitude respeitando vetor
+      ordenadosFinal = ok.slice().sort(function (a, b) {
+        return ascendente ? a.lng - b.lng : b.lng - a.lng;
+      });
     } else {
-      var todosDoGrupo = [entrada].concat(meio).concat([saida]);
-      var reordenados = rotaOtim.ordem.map(function (i) { return todosDoGrupo[i]; });
-      ordenadosFinal = ordenadosFinal.concat(reordenados);
+      var todos = [entrada].concat(meio).concat([saida]);
+      ordenadosFinal = rotaOtim.ordem.map(function (i) { return todos[i]; });
     }
   }
 
@@ -568,7 +549,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.1 · Google Maps</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.2 · Google Maps</div>
           </div>
         </div>
         <div style={styles.headerRight}>
