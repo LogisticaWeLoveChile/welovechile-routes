@@ -40,7 +40,8 @@ export default async function handler(req, res) {
     origin: { location: { latLng: { latitude: origin.lat, longitude: origin.lng } } },
     destination: { location: { latLng: { latitude: destination.lat, longitude: destination.lng } } },
     travelMode: "DRIVE",
-    routingPreference: "TRAFFIC_AWARE_OPTIMAL",
+    // TRAFFIC_AWARE suporta otimização de waypoints. TRAFFIC_AWARE_OPTIMAL não.
+    routingPreference: "TRAFFIC_AWARE",
     optimizeWaypointOrder: !!optimize,
     languageCode: "es-CL",
     units: "METRIC"
