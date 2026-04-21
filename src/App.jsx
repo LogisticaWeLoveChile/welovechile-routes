@@ -181,8 +181,7 @@ async function otimizarRota(pontos, horarioPartida, tentativa) {
   }
 }
 
-// Routes API: limite 25 intermediários, ou seja MAX 27 pontos total (origem + 25 + destino).
-// Mas por segurança usamos 24 intermediários = 26 pontos max.
+// Routes API: limite 25 intermediários. Usamos 24 + origem + destino = 26 total.
 var MAX_PONTOS_POR_CHAMADA = 26;
 
 async function otimizarRotaEmPedacos(pontos, horarioPartida) {
@@ -782,7 +781,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.9 · Retry + Pedaços corrigidos</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v6.0 · Otimização Real</div>
           </div>
         </div>
         <div style={styles.headerRight}>
