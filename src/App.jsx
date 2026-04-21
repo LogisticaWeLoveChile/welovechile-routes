@@ -35,18 +35,21 @@ var TIPOS_VAN_DEFAULT = [
   { id: "t18", capacidade: 18 }, { id: "t19", capacidade: 19 }
 ];
 
-// Comuna do Google → setor interno
-var MAPA_COMUNA_SETOR = {
-  "estación central": 1, "estacion central": 1, "quinta normal": 1, "lo prado": 1, "pudahuel": 1,
-  "santiago": 2,
-  "providencia": 3, "ñuñoa": 3, "nunoa": 3,
-  "las condes": 4, "vitacura": 4, "lo barnechea": 4
-};
+// Determina setor por COORDENADAS (mais confiável que nome de comuna)
+// Santiago tem longitudes: Oeste ~-70.70 ... Leste ~-70.50
+//                          latitudes centrais:  ~-33.45
+// Setores são faixas verticais de longitude
+function setorPorCoordenadas(lat, lng) {
+  if (!lat || !lng) return 99;
+  // Fora de Santiago (lat muito fora da faixa) → outro
+  if (lat < -33.65 || lat > -33.30) return 99;
+  if (lng < -70.80 || lng > -70.45) return 99;
 
-function setorPorComuna(comuna) {
-  if (!comuna) return 99;
-  var key = comuna.toLowerCase().trim();
-  return MAPA_COMUNA_SETOR[key] || 99;
+  // Faixas de longitude (ajustadas para Santiago)
+  if (lng < -70.660) return 1; // Estación Central / Quinta Normal / Pudahuel
+  if (lng < -70.625) return 2; // Centro histórico (Plaza de Armas, Alameda, Lastarria)
+  if (lng < -70.585) return 3; // Providencia (Manuel Montt, Pedro de Valdivia, Los Leones)
+  return 4;                     // Las Condes / Vitacura / Lo Barnechea
 }
 
 function nomeSetor(setor) {
@@ -101,7 +104,8 @@ async function geocodificar(endereco, cache, tentativa) {
     var data = await resp.json();
     var resultado = {
       lat: data.lat, lng: data.lng,
-      comuna: data.comuna, setor: setorPorComuna(data.comuna),
+      comuna: data.comuna,
+      setor: setorPorCoordenadas(data.lat, data.lng),
       formatted: data.formatted
     };
     cache[k] = resultado;
@@ -117,7 +121,30 @@ async function geocodificar(endereco, cache, tentativa) {
 }
 
 // ============================================================
-// ROUTES API (otimização real)
+// HAVERSINE + tempo estimado por distância (fallback quando Routes API falha)
+// ============================================================
+function distanciaKm(lat1, lng1, lat2, lng2) {
+  var R = 6371;
+  var toRad = function (x) { return (x * Math.PI) / 180; };
+  var dLat = toRad(lat2 - lat1);
+  var dLng = toRad(lng2 - lng1);
+  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function tempoEstimadoMin(a, b) {
+  if (!a.lat || !b.lat) return 10;
+  var km = distanciaKm(a.lat, a.lng, b.lat, b.lng);
+  var mesmoSetor = a.setor === b.setor;
+  var fatorMalha = mesmoSetor ? 1.35 : 1.55;
+  var velocKmH = mesmoSetor ? 22 : 28;
+  var min = (km * fatorMalha / velocKmH) * 60 + 1.5;
+  return arredondar5(min);
+}
+
+// ============================================================
+// ROTAS API (otimização real)
 // ============================================================
 async function otimizarRota(pontos) {
   if (pontos.length < 2) return { ordem: pontos.map(function (_, i) { return i; }), legs: [] };
@@ -213,7 +240,7 @@ function somarMinutos(hora, min) {
 }
 function arredondar5(min) {
   var r = Math.round(min / 5) * 5;
-  return r < 5 ? 5 : r;
+  return r < 3 ? 3 : r;
 }
 
 // ============================================================
@@ -294,33 +321,63 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
   });
 
   // 4. Pra cada setor, otimiza a ordem interna via Routes API
+  //    Forçando entrada pelo ponto mais próximo do setor anterior
+  //    e saída pelo ponto mais próximo do próximo setor
   var ordenadosFinal = [];
-  var todasLegs = []; // tempos reais entre paradas consecutivas
 
-  for (var idx = 0; idx < ordemSetores.length; idx++) {
-    var setor = ordemSetores[idx];
+  var setoresAtivos = ordemSetores.filter(function (s) { return clusters[s] && clusters[s].length > 0; });
+
+  for (var idx = 0; idx < setoresAtivos.length; idx++) {
+    var setor = setoresAtivos[idx];
     var grupo = clusters[setor];
-    if (!grupo || grupo.length === 0) continue;
 
-    if (grupo.length <= 2) {
-      // Não precisa otimizar
-      ordenadosFinal = ordenadosFinal.concat(grupo);
+    // Determina ponto de entrada/saída do cluster pela direção do vetor
+    // Para tours leste/norte/sudeste: entra pelo oeste (lng menor) e sai pelo leste (lng maior)
+    // Para tours oeste/sudoeste/sul: entra pelo leste (lng maior) e sai pelo oeste (lng menor)
+    var ascendente = (vetor === "leste" || vetor === "norte" || vetor === "sudeste" || vetor === "nordeste");
+
+    if (grupo.length === 1) {
+      ordenadosFinal.push(grupo[0]);
+      continue;
+    }
+
+    if (grupo.length === 2) {
+      // Ordena os 2 pontos pela longitude conforme direção
+      var par = grupo.slice().sort(function (a, b) {
+        return ascendente ? a.lng - b.lng : b.lng - a.lng;
+      });
+      ordenadosFinal = ordenadosFinal.concat(par);
+      continue;
+    }
+
+    // 3+ pontos: escolhe origem/destino pelo extremo de longitude, otimiza o meio via Routes API
+    var ordenadoPorLng = grupo.slice().sort(function (a, b) {
+      return ascendente ? a.lng - b.lng : b.lng - a.lng;
+    });
+    var entrada = ordenadoPorLng[0];
+    var saida = ordenadoPorLng[ordenadoPorLng.length - 1];
+    var meio = ordenadoPorLng.slice(1, -1);
+
+    if (onProgress) onProgress("Otimizando " + nomeSetor(setor) + " (" + grupo.length + " paradas)...");
+
+    var pts = [{ lat: entrada.lat, lng: entrada.lng }]
+      .concat(meio.map(function (r) { return { lat: r.lat, lng: r.lng }; }))
+      .concat([{ lat: saida.lat, lng: saida.lng }]);
+
+    var rotaOtim = await otimizarRota(pts);
+    if (rotaOtim.erro) {
+      // Fallback: mantém ordem por longitude
+      ordenadosFinal = ordenadosFinal.concat(ordenadoPorLng);
     } else {
-      if (onProgress) onProgress("Otimizando rota em " + nomeSetor(setor) + " (" + grupo.length + " paradas)...");
-      var pts = grupo.map(function (r) { return { lat: r.lat, lng: r.lng }; });
-      var rotaOtim = await otimizarRota(pts);
-      if (rotaOtim.erro) {
-        // Fallback: usa ordem original
-        ordenadosFinal = ordenadosFinal.concat(grupo);
-      } else {
-        var reordenados = rotaOtim.ordem.map(function (i) { return grupo[i]; });
-        ordenadosFinal = ordenadosFinal.concat(reordenados);
-      }
+      var todosDoGrupo = [entrada].concat(meio).concat([saida]);
+      var reordenados = rotaOtim.ordem.map(function (i) { return todosDoGrupo[i]; });
+      ordenadosFinal = ordenadosFinal.concat(reordenados);
     }
   }
 
   // 5. Adiciona falhos no final
   ordenadosFinal = ordenadosFinal.concat(falhos);
+  var todasLegs = [];
 
   // 6. Calcula tempos REAIS entre paradas consecutivas (uma chamada Routes só pra tempos)
   if (ordenadosFinal.filter(function (r) { return r.lat; }).length >= 2) {
@@ -347,10 +404,14 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
       var min;
       var atual = ordenadosFinal[j], anterior = ordenadosFinal[j - 1];
       if (atual.lat && anterior.lat && todasLegs[idxLeg]) {
+        // Usa tempo real do Google, arredondando ao múltiplo de 5 mais próximo
         min = arredondar5(todasLegs[idxLeg].durationSec / 60 + 1.5);
         idxLeg++;
+      } else if (atual.lat && anterior.lat) {
+        // Fallback por distância Haversine
+        min = tempoEstimadoMin(anterior, atual);
       } else {
-        min = 10; // fallback
+        min = 10;
       }
       deslocs[j] = min;
       horarios[j] = somarMinutos(horarios[j - 1], min);
@@ -450,33 +511,51 @@ export default function App() {
   // Drag & drop
   function onDragStart(rId, rotaIdx) { setDragging({ rId: rId, rotaIdx: rotaIdx }); }
   function onDragOver(e) { e.preventDefault(); }
-  function onDrop(target) {
+  async function onDrop(target) {
     if (!dragging || dragging.rotaIdx === target) { setDragging(null); return; }
-    var novas = resultado.rotas.map(function (r, i) {
-      if (i === dragging.rotaIdx) {
-        return { ...r, reservas: r.reservas.filter(function (x) { return x.id !== dragging.rId; }) };
-      }
-      if (i === target) {
-        var movido = resultado.rotas[dragging.rotaIdx].reservas.find(function (x) { return x.id === dragging.rId; });
-        return { ...r, reservas: r.reservas.concat([movido]) };
-      }
-      return r;
-    }).filter(function (r) { return r.reservas.length > 0; });
+    setProcessando(true);
+    setStatusMsg("Recalculando rotas após movimento...");
 
-    // Recalcula horários e totais em cada rota
-    novas = novas.map(function (r) {
-      var horarios = [], deslocs = [];
-      for (var i = 0; i < r.reservas.length; i++) {
-        if (i === 0) { horarios[i] = horarioEf; deslocs[i] = 0; }
-        else { deslocs[i] = r.reservas[i].deslocamentoMin || 10; horarios[i] = somarMinutos(horarios[i - 1], deslocs[i]); }
-      }
-      var rsNew = r.reservas.map(function (x, i) { return { ...x, horario: horarios[i], deslocamentoMin: deslocs[i] }; });
-      var tp = rsNew.reduce(function (s, x) { return s + x.passageiros; }, 0);
-      return { ...r, reservas: rsNew, totalPax: tp, excesso: tp > r.van.capacidade, linkMaps: linkMaps(rsNew) };
-    });
+    try {
+      // Monta as novas listas de reservas por rota
+      var novasListas = resultado.rotas.map(function (r, i) {
+        if (i === dragging.rotaIdx) {
+          return r.reservas.filter(function (x) { return x.id !== dragging.rId; });
+        }
+        if (i === target) {
+          var movido = resultado.rotas[dragging.rotaIdx].reservas.find(function (x) { return x.id === dragging.rId; });
+          return r.reservas.concat([movido]);
+        }
+        return r.reservas;
+      });
 
-    setResultado({ rotas: novas });
-    setDragging(null);
+      // Remove rotas vazias e mantém a van associada
+      var novasRotas = [];
+      for (var i = 0; i < resultado.rotas.length; i++) {
+        if (novasListas[i].length === 0) continue;
+        var rotaOriginal = resultado.rotas[i];
+
+        // Reprocessa a rota (cluster + otimização do Google) com as reservas novas
+        var reprocessadas = await processarRotaB3(novasListas[i], tourAtual.vetor, horarioEf, cache, setStatusMsg);
+        var tp = reprocessadas.reduce(function (s, r) { return s + r.passageiros; }, 0);
+
+        novasRotas.push({
+          van: rotaOriginal.van,
+          reservas: reprocessadas,
+          totalPax: tp,
+          excesso: tp > rotaOriginal.van.capacidade,
+          linkMaps: linkMaps(reprocessadas)
+        });
+      }
+
+      setResultado({ rotas: novasRotas });
+      setStatusMsg("");
+    } catch (e) {
+      setStatusMsg("Erro ao recalcular: " + e.message);
+    } finally {
+      setProcessando(false);
+      setDragging(null);
+    }
   }
 
   // Render
