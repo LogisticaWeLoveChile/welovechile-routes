@@ -568,7 +568,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5 · Google Maps</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.1 · Google Maps</div>
           </div>
         </div>
         <div style={styles.headerRight}>
