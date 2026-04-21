@@ -373,20 +373,29 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
     var porLng = ok.slice().sort(function (a, b) { return a.lng - b.lng; });
     var porLat = ok.slice().sort(function (a, b) { return a.lat - b.lat; });
 
-    // Candidatos de par origem-destino: vários extremos possíveis
-    // Com rotas grandes (>15 pontos), testamos só 2 pares para economizar chamadas
-    var paresCandidatos;
-    if (ok.length > 15) {
+    // Candidatos de par origem-destino:
+    // - Rotas pequenas (<=8 pontos): testa TODAS as combinações (N*(N-1)/2 pares)
+    // - Rotas médias (9-15 pontos): testa 4 pares de extremos
+    // - Rotas grandes (>15): testa só 2 pares (economia)
+    var paresCandidatos = [];
+    if (ok.length <= 8) {
+      // Todas as combinações possíveis
+      for (var i1 = 0; i1 < ok.length; i1++) {
+        for (var j1 = 0; j1 < ok.length; j1++) {
+          if (i1 !== j1) paresCandidatos.push([ok[i1], ok[j1]]);
+        }
+      }
+    } else if (ok.length <= 15) {
       paresCandidatos = [
-        [porLng[0], porLng[porLng.length - 1]],                      // mais oeste ↔ mais leste
-        [porLat[0], porLat[porLat.length - 1]]                       // mais sul ↔ mais norte
+        [porLng[0], porLng[porLng.length - 1]],
+        [porLat[0], porLat[porLat.length - 1]],
+        [porLng[0], porLat[porLat.length - 1]],
+        [porLng[porLng.length - 1], porLat[0]]
       ];
     } else {
       paresCandidatos = [
-        [porLng[0], porLng[porLng.length - 1]],                      // mais oeste ↔ mais leste
-        [porLat[0], porLat[porLat.length - 1]],                      // mais sul ↔ mais norte
-        [porLng[0], porLat[porLat.length - 1]],                      // mais oeste ↔ mais norte
-        [porLng[porLng.length - 1], porLat[0]]                       // mais leste ↔ mais sul
+        [porLng[0], porLng[porLng.length - 1]],
+        [porLat[0], porLat[porLat.length - 1]]
       ];
     }
 
@@ -434,17 +443,41 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
   ordenadosFinal = ordenadosFinal.concat(falhos);
   var todasLegs = [];
 
-  // 6. Calcula tempos REAIS entre paradas consecutivas (uma chamada Routes só pra tempos)
+  // 6. Calcula tempos REAIS entre paradas consecutivas (divide em pedaços se muitos pontos)
   if (ordenadosFinal.filter(function (r) { return r.lat; }).length >= 2) {
     if (onProgress) onProgress("Calculando tempos reais...");
     var ptsFinal = ordenadosFinal.filter(function (r) { return r.lat; }).map(function (r) { return { lat: r.lat, lng: r.lng }; });
-    var temposReq = await fetch("/api/routes", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ points: ptsFinal, optimize: false })
-    });
-    if (temposReq.ok) {
-      var tempData = await temposReq.json();
-      todasLegs = tempData.legs || [];
+
+    // Divide em chunks de MAX_PONTOS_POR_CHAMADA-1, com overlap de 1 ponto
+    if (ptsFinal.length <= MAX_PONTOS_POR_CHAMADA) {
+      try {
+        var temposReq = await fetch("/api/routes", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ points: ptsFinal, optimize: false })
+        });
+        if (temposReq.ok) {
+          var tempData = await temposReq.json();
+          todasLegs = tempData.legs || [];
+        }
+      } catch (e) {}
+    } else {
+      // Divide em pedaços
+      var chunk = MAX_PONTOS_POR_CHAMADA - 1;
+      for (var pi = 0; pi < ptsFinal.length - 1; pi += chunk) {
+        var fim = Math.min(pi + chunk + 1, ptsFinal.length);
+        var subPts = ptsFinal.slice(pi, fim);
+        try {
+          var rsp = await fetch("/api/routes", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ points: subPts, optimize: false })
+          });
+          if (rsp.ok) {
+            var td = await rsp.json();
+            todasLegs = todasLegs.concat(td.legs || []);
+          }
+        } catch (e) {}
+        if (fim >= ptsFinal.length) break;
+      }
     }
   }
 
@@ -623,7 +656,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.5 · Google Maps</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.6 · Google Maps</div>
           </div>
         </div>
         <div style={styles.headerRight}>
