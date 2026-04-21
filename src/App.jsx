@@ -172,6 +172,48 @@ async function otimizarRota(pontos) {
   }
 }
 
+// Routes API aceita máximo de 25 waypoints intermediários.
+// Se uma chamada tem mais pontos que isso, dividimos em pedaços.
+var MAX_PONTOS_POR_CHAMADA = 25;
+
+async function otimizarRotaEmPedacos(pontos) {
+  if (pontos.length <= MAX_PONTOS_POR_CHAMADA) {
+    return await otimizarRota(pontos);
+  }
+  var tamanho = MAX_PONTOS_POR_CHAMADA - 1;
+  var pedacos = [];
+  for (var i = 0; i < pontos.length; i += tamanho) {
+    var fim = Math.min(i + tamanho + 1, pontos.length);
+    pedacos.push(pontos.slice(i, fim));
+    if (fim >= pontos.length) break;
+  }
+
+  var ordemFinal = [];
+  var legsFinal = [];
+  var offset = 0;
+
+  for (var p = 0; p < pedacos.length; p++) {
+    var pd = pedacos[p];
+    if (pd.length < 2) {
+      ordemFinal.push(offset);
+      offset += pd.length;
+      continue;
+    }
+    var r = await otimizarRota(pd);
+    if (r.erro) {
+      for (var q = 0; q < pd.length; q++) ordemFinal.push(offset + q);
+    } else {
+      var ordemPedaco = r.ordem.map(function (ix) { return ix + offset; });
+      if (p > 0) ordemPedaco.shift();
+      ordemFinal = ordemFinal.concat(ordemPedaco);
+      legsFinal = legsFinal.concat(r.legs || []);
+    }
+    offset += pd.length - 1;
+  }
+
+  return { ordem: ordemFinal, legs: legsFinal };
+}
+
 // ============================================================
 // PARSER COLAGEM (formato sistema atual)
 // ============================================================
@@ -332,12 +374,21 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
     var porLat = ok.slice().sort(function (a, b) { return a.lat - b.lat; });
 
     // Candidatos de par origem-destino: vários extremos possíveis
-    var paresCandidatos = [
-      [porLng[0], porLng[porLng.length - 1]],                      // mais oeste ↔ mais leste
-      [porLat[0], porLat[porLat.length - 1]],                      // mais sul ↔ mais norte
-      [porLng[0], porLat[porLat.length - 1]],                      // mais oeste ↔ mais norte
-      [porLng[porLng.length - 1], porLat[0]]                       // mais leste ↔ mais sul
-    ];
+    // Com rotas grandes (>15 pontos), testamos só 2 pares para economizar chamadas
+    var paresCandidatos;
+    if (ok.length > 15) {
+      paresCandidatos = [
+        [porLng[0], porLng[porLng.length - 1]],                      // mais oeste ↔ mais leste
+        [porLat[0], porLat[porLat.length - 1]]                       // mais sul ↔ mais norte
+      ];
+    } else {
+      paresCandidatos = [
+        [porLng[0], porLng[porLng.length - 1]],                      // mais oeste ↔ mais leste
+        [porLat[0], porLat[porLat.length - 1]],                      // mais sul ↔ mais norte
+        [porLng[0], porLat[porLat.length - 1]],                      // mais oeste ↔ mais norte
+        [porLng[porLng.length - 1], porLat[0]]                       // mais leste ↔ mais sul
+      ];
+    }
 
     // Remove pares inválidos (mesmos pontos)
     paresCandidatos = paresCandidatos.filter(function (p) { return p[0] !== p[1]; });
@@ -354,7 +405,7 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
         .concat(meio.map(function (r) { return { lat: r.lat, lng: r.lng }; }))
         .concat([{ lat: b.lat, lng: b.lng }]);
 
-      var rotaOtim = await otimizarRota(pts);
+      var rotaOtim = await otimizarRotaEmPedacos(pts);
       if (rotaOtim.erro) continue;
 
       var duracao = (rotaOtim.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
@@ -572,7 +623,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.4 · Google Maps</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.5 · Google Maps</div>
           </div>
         </div>
         <div style={styles.headerRight}>
