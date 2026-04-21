@@ -312,47 +312,75 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
   var falhos = enriquecidos.filter(function (r) { return !r.lat; });
 
   var ordenadosFinal = [];
+  var ascendente = (vetor === "leste" || vetor === "norte" || vetor === "sudeste" || vetor === "nordeste");
 
   if (ok.length === 0) {
     ordenadosFinal = [];
   } else if (ok.length === 1) {
     ordenadosFinal = ok;
   } else if (ok.length === 2) {
-    // 2 pontos: ordena pela direção do vetor
-    var ascendente2 = (vetor === "leste" || vetor === "norte" || vetor === "sudeste" || vetor === "nordeste");
     ordenadosFinal = ok.slice().sort(function (a, b) {
-      return ascendente2 ? a.lng - b.lng : b.lng - a.lng;
+      return ascendente ? a.lng - b.lng : b.lng - a.lng;
     });
   } else {
-    // 3+ pontos: fixa extremos pelo vetor, Google otimiza o meio livremente
-    var ascendente = (vetor === "leste" || vetor === "norte" || vetor === "sudeste" || vetor === "nordeste");
+    // Estratégia: testamos múltiplos cenários de origem/destino e escolhemos o de menor tempo.
+    // Isso resolve o caso em que "extremo de longitude" não é o melhor início/fim.
+    if (onProgress) onProgress("Otimizando rota (" + ok.length + " paradas) via Google...");
 
-    // Ordena por longitude e pega os extremos
     var porLng = ok.slice().sort(function (a, b) { return a.lng - b.lng; });
     var maisOeste = porLng[0];
     var maisLeste = porLng[porLng.length - 1];
 
-    // Entrada (primeiro ponto da rota) e saída (último) conforme vetor
-    var entrada = ascendente ? maisOeste : maisLeste;
-    var saida = ascendente ? maisLeste : maisOeste;
-    var meio = ok.filter(function (r) { return r !== entrada && r !== saida; });
+    // Candidatos de origem/destino - respeitando o sentido do vetor
+    var candidatos = [];
+    if (ascendente) {
+      // Tour para leste: começa no oeste, termina no leste
+      // Candidato 1: começa no mais oeste, termina no mais leste
+      candidatos.push({ entrada: maisOeste, saida: maisLeste });
+      // Candidato 2: começa no mais oeste, termina no segundo mais leste (se houver)
+      if (ok.length >= 4) {
+        candidatos.push({ entrada: maisOeste, saida: porLng[porLng.length - 2] });
+      }
+    } else {
+      // Tour para oeste: começa no leste, termina no oeste
+      candidatos.push({ entrada: maisLeste, saida: maisOeste });
+      if (ok.length >= 4) {
+        candidatos.push({ entrada: maisLeste, saida: porLng[1] });
+      }
+    }
 
-    if (onProgress) onProgress("Otimizando rota (" + ok.length + " paradas) via Google...");
+    // Testa todos os candidatos e pega o de menor duração total
+    var melhorResultado = null;
+    var melhorDuracao = Infinity;
 
-    // Monta pontos: entrada + meio + saida
-    var pts = [{ lat: entrada.lat, lng: entrada.lng }]
-      .concat(meio.map(function (r) { return { lat: r.lat, lng: r.lng }; }))
-      .concat([{ lat: saida.lat, lng: saida.lng }]);
+    for (var c = 0; c < candidatos.length; c++) {
+      var ent = candidatos[c].entrada;
+      var sai = candidatos[c].saida;
+      if (ent === sai) continue;
+      var meio = ok.filter(function (r) { return r !== ent && r !== sai; });
 
-    var rotaOtim = await otimizarRota(pts);
-    if (rotaOtim.erro) {
-      // Fallback: ordena por longitude respeitando vetor
+      var pts = [{ lat: ent.lat, lng: ent.lng }]
+        .concat(meio.map(function (r) { return { lat: r.lat, lng: r.lng }; }))
+        .concat([{ lat: sai.lat, lng: sai.lng }]);
+
+      var rotaOtim = await otimizarRota(pts);
+      if (rotaOtim.erro) continue;
+
+      var duracao = (rotaOtim.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
+      if (duracao < melhorDuracao) {
+        melhorDuracao = duracao;
+        var todos = [ent].concat(meio).concat([sai]);
+        melhorResultado = rotaOtim.ordem.map(function (i) { return todos[i]; });
+      }
+    }
+
+    if (melhorResultado) {
+      ordenadosFinal = melhorResultado;
+    } else {
+      // Fallback: ordena por longitude
       ordenadosFinal = ok.slice().sort(function (a, b) {
         return ascendente ? a.lng - b.lng : b.lng - a.lng;
       });
-    } else {
-      var todos = [entrada].concat(meio).concat([saida]);
-      ordenadosFinal = rotaOtim.ordem.map(function (i) { return todos[i]; });
     }
   }
 
@@ -549,7 +577,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.2 · Google Maps</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.3 · Google Maps</div>
           </div>
         </div>
         <div style={styles.headerRight}>
