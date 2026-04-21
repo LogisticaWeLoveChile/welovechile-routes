@@ -2,18 +2,18 @@ import React, { useState, useMemo, useEffect } from "react";
 import { styles } from "./styles.js";
 
 // ============================================================
-// WeLoveChile Route Dispatcher v7.0 (Clustering geográfico + Otimização Google)
+// WeLoveChile Route Dispatcher v7.1 (Clustering + 2-opt + eixo adaptativo)
 //
-// MUDANÇA PRINCIPAL vs v6.0:
-//   ANTES: 1) otimiza todos juntos no Google  2) fatia por capacidade
-//   AGORA: 1) ordena por longitude  2) fatia balanceada respeitando capacidade
-//          3) otimiza CADA VAN separadamente no Google
+// MUDANÇAS vs v7.0:
+//  - 2-opt local após otimização Google: reduz km sem piorar tempo >10%
+//  - Escolha de origem/destino por EIXO DOMINANTE do cluster (lat ou lng)
 //
-// Vantagens:
-//  - Cada van vira um trecho geograficamente coerente do vetor do tour
-//  - Balanceamento ótimo de pax entre vans (minimiza max-min)
-//  - Menos chamadas à Routes API (1 por van pequena ao invés de 1 gigante + chunks)
-//  - Fallback automático com relaxamento quando contiguidade estrita é inviável
+// PIPELINE:
+//  1) Ordena por longitude no vetor do tour
+//  2) Fatia balanceada respeitando capacidade (com relaxamento se inviável)
+//  3) Pra cada van: escolhe eixo dominante (lat ou lng), define origem/destino
+//  4) Otimiza a van no Google
+//  5) Passa 2-opt local pra reduzir km sem estragar tempo
 // ============================================================
 
 var TOURS_DEFAULT = [
@@ -177,26 +177,152 @@ async function chamarRoutes(pontos, horarioPartida, otimizar, tentativa) {
   }
 }
 
-// Otimiza rota de uma van: força origem/destino nos extremos da longitude do vetor
-async function otimizarVan(pontosVan, vetor, horarioPartida) {
+// Calcula o eixo dominante do cluster: se lat varia mais que lng, usa lat;
+// senão, usa lng. Retorna função que extrai a coordenada dominante.
+function eixoDominante(pontos) {
+  if (pontos.length < 2) return { eixo: "lng", extrair: function (p) { return p.lng; } };
+  var lats = pontos.map(function (p) { return p.lat; });
+  var lngs = pontos.map(function (p) { return p.lng; });
+  var deltaLat = Math.max.apply(null, lats) - Math.min.apply(null, lats);
+  var deltaLng = Math.max.apply(null, lngs) - Math.min.apply(null, lngs);
+  // 1° lat ≈ 111km, 1° lng em Santiago ≈ 93km; corrige lng pra comparação justa
+  var deltaLngCorrigido = deltaLng * 0.837;
+  if (deltaLat > deltaLngCorrigido) {
+    return { eixo: "lat", extrair: function (p) { return p.lat; } };
+  }
+  return { eixo: "lng", extrair: function (p) { return p.lng; } };
+}
+
+// Dado vetor do tour e eixo dominante, decide se ordenação é ascendente
+// - vetor leste/sudeste/nordeste: lng ascendente (oeste→leste); lat descendente (norte→sul para sudeste, ou oposto)
+// - vetor oeste: lng descendente; lat ascendente (sul→norte)
+// - vetor sul: lat descendente (norte→sul)
+// - vetor norte: lat ascendente (sul→norte)
+//
+// Regra simplificada: quando eixo é o "natural" do vetor, segue direção do vetor.
+// Quando eixo é ortogonal, escolhemos a direção que mantém a continuidade
+// com o próximo ponto do tour (mas como não sabemos destino final, usamos heurística:
+// vetores leste-like → preferir ordem "de cima pra baixo" no eixo ortogonal,
+// vetores oeste-like → idem; usuário pode refinar depois).
+function ordemAscendente(vetor, eixo) {
+  if (eixo === "lng") {
+    return (vetor === "leste" || vetor === "norte" || vetor === "sudeste" || vetor === "nordeste");
+  }
+  // eixo = lat
+  if (vetor === "sul") return false; // norte pra sul = lat descendente
+  if (vetor === "norte") return true;
+  // Pros vetores lateralmente orientados com cluster vertical, default: norte→sul
+  // (lat descendente). Faz sentido em Santiago porque tours de Vitacura→Las Condes
+  // geralmente passam primeiro por Vitacura (norte) antes de descer.
+  return false;
+}
+
+// 2-opt local: tenta inverter segmentos [i..j] da rota pra reduzir km.
+// Aceita se: (a) melhora km E tempo (Pareto), ou
+//            (b) melhora km >300m E tempo não piora mais que toleranciaPct%
+// Retorna { rota, trocas }
+function doisOptLocal(rota, toleranciaPct, vanNum) {
+  var r = rota.slice();
+  var n = r.length;
+  if (n <= 3) return { rota: r, trocas: [] };
+
+  // Precisa de lat/lng válidos em todos pontos
+  var todosOk = r.every(function (p) { return p.lat && p.lng; });
+  if (!todosOk) return { rota: r, trocas: [] };
+
+  var trocas = [];
+  var melhorou = true;
+  var iter = 0;
+  while (melhorou && iter < 30) {
+    melhorou = false;
+    iter++;
+
+    // Origem (0) e destino (n-1) FIXOS. Inverte segmentos internos.
+    for (var i = 1; i < n - 2 && !melhorou; i++) {
+      for (var j = i + 1; j < n - 1 && !melhorou; j++) {
+        // Arcos que mudam com inversão:
+        // antes: r[i-1]→r[i] e r[j]→r[j+1]
+        // depois: r[i-1]→r[j] e r[i]→r[j+1]
+        var antesKm = distanciaKm(r[i - 1].lat, r[i - 1].lng, r[i].lat, r[i].lng) +
+          distanciaKm(r[j].lat, r[j].lng, r[j + 1].lat, r[j + 1].lng);
+        var depoisKm = distanciaKm(r[i - 1].lat, r[i - 1].lng, r[j].lat, r[j].lng) +
+          distanciaKm(r[i].lat, r[i].lng, r[j + 1].lat, r[j + 1].lng);
+
+        // Tempo estimado via Haversine (proxy — não chama Google)
+        var antesMin = tempoEstimadoMin(r[i - 1], r[i]) + tempoEstimadoMin(r[j], r[j + 1]);
+        var depoisMin = tempoEstimadoMin(r[i - 1], r[j]) + tempoEstimadoMin(r[i], r[j + 1]);
+
+        var deltaKm = depoisKm - antesKm;
+        var deltaMin = depoisMin - antesMin;
+
+        var aceitar = false;
+        var razao = "";
+
+        if (deltaKm < -0.1 && deltaMin < 0) {
+          aceitar = true;
+          razao = "Pareto (km↓ e min↓)";
+        } else if (deltaKm < -0.3) {
+          // Melhora km significativa (>300m). Tempo não pode piorar mais que toleranciaPct%
+          var limite = Math.max(antesMin * (toleranciaPct / 100), 1.0); // mínimo 1 min de folga
+          if (deltaMin <= limite) {
+            aceitar = true;
+            razao = "ganho " + (-deltaKm).toFixed(1) + "km, custo " + deltaMin.toFixed(1) + "min (tol " + toleranciaPct + "%)";
+          }
+        }
+
+        if (aceitar) {
+          var inverso = r.slice(i, j + 1).reverse();
+          r = r.slice(0, i).concat(inverso).concat(r.slice(j + 1));
+          trocas.push({
+            van: vanNum,
+            pontos: inverso.map(function (p) { return p.endereco; }),
+            deltaKm: deltaKm,
+            deltaMin: deltaMin,
+            razao: razao
+          });
+          melhorou = true;
+        }
+      }
+    }
+  }
+  return { rota: r, trocas: trocas };
+}
+
+// Otimiza rota de uma van:
+// 1) Escolhe eixo dominante (lat ou lng)
+// 2) Ordena pontos no eixo, define entrada/saída como extremos
+// 3) Chama Google Routes pra otimizar o meio
+// 4) Passa 2-opt local pra reduzir km
+async function otimizarVan(pontosVan, vetor, horarioPartida, vanNum) {
   var n = pontosVan.length;
-  if (n === 0) return [];
-  if (n === 1) return pontosVan.slice();
+  if (n === 0) return { pontos: [], trocas2opt: [] };
+  if (n === 1) return { pontos: pontosVan.slice(), trocas2opt: [] };
 
   var ok = pontosVan.filter(function (p) { return p.lat; });
   var falhos = pontosVan.filter(function (p) { return !p.lat; });
 
   if (ok.length < 2) {
-    return ok.concat(falhos);
+    return { pontos: ok.concat(falhos), trocas2opt: [] };
   }
 
-  var ascendente = ascendentePorVetor(vetor);
-  var porLng = ok.slice().sort(function (a, b) { return a.lng - b.lng; });
-  var entrada = ascendente ? porLng[0] : porLng[porLng.length - 1];
-  var saida = ascendente ? porLng[porLng.length - 1] : porLng[0];
+  // === Eixo dominante e ordenação ===
+  var eixo = eixoDominante(ok);
+  var asc = ordemAscendente(vetor, eixo.eixo);
+  var ordenados = ok.slice().sort(function (a, b) {
+    var va = eixo.extrair(a), vb = eixo.extrair(b);
+    return asc ? va - vb : vb - va;
+  });
+
+  var entrada = ordenados[0];
+  var saida = ordenados[ordenados.length - 1];
+
+  if (typeof console !== "undefined") {
+    console.log("  Van " + vanNum + ": eixo=" + eixo.eixo + " asc=" + asc +
+      " | origem=" + entrada.endereco + " destino=" + saida.endereco);
+  }
 
   if (ok.length === 2) {
-    return [entrada, saida].concat(falhos);
+    return { pontos: [entrada, saida].concat(falhos), trocas2opt: [] };
   }
 
   var meio = ok.filter(function (p) { return p !== entrada && p !== saida; });
@@ -205,16 +331,25 @@ async function otimizarVan(pontosVan, vetor, horarioPartida) {
     .concat([{ lat: saida.lat, lng: saida.lng }]);
 
   var r = await chamarRoutes(pts, horarioPartida, true);
+  var rotaGoogle;
   if (r.erro) {
-    if (typeof console !== "undefined") console.warn("⚠️ Van falhou otimização, usando fallback por lng:", r.erro);
-    var fallback = porLng;
-    if (!ascendente) fallback = fallback.slice().reverse();
-    return fallback.concat(falhos);
+    if (typeof console !== "undefined") console.warn("⚠️ Van " + vanNum + " falhou otimização, usando ordem pelo eixo:", r.erro);
+    rotaGoogle = ordenados;
+  } else {
+    var todos = [entrada].concat(meio).concat([saida]);
+    rotaGoogle = r.ordem.map(function (i) { return todos[i]; });
   }
 
-  var todos = [entrada].concat(meio).concat([saida]);
-  var ordenado = r.ordem.map(function (i) { return todos[i]; });
-  return ordenado.concat(falhos);
+  // === 2-opt local ===
+  var resOpt = doisOptLocal(rotaGoogle, 10, vanNum);
+  if (typeof console !== "undefined" && resOpt.trocas.length > 0) {
+    resOpt.trocas.forEach(function (t) {
+      console.log("  🔄 2-opt Van " + t.van + ": inverteu [" + t.pontos.join(", ") +
+        "] → " + t.deltaKm.toFixed(1) + "km, " + (t.deltaMin >= 0 ? "+" : "") + t.deltaMin.toFixed(1) + "min | " + t.razao);
+    });
+  }
+
+  return { pontos: resOpt.rota.concat(falhos), trocas2opt: resOpt.trocas };
 }
 
 // ============================================================
@@ -534,13 +669,16 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
     });
   }
 
-  // 4. Otimiza cada van separadamente no Google
+  // 4. Otimiza cada van separadamente no Google + 2-opt local
   var fatiasComRota = [];
+  var totalTrocas2opt = 0;
   for (var fi = 0; fi < clusterResult.fatias.length; fi++) {
     var fatia = clusterResult.fatias[fi];
     if (onProgress) onProgress("Otimizando rota da van " + (fi + 1) + "/" + clusterResult.fatias.length + "...");
 
-    var otimizados = await otimizarVan(fatia.pontos, vetor, horarioInicio);
+    var otRes = await otimizarVan(fatia.pontos, vetor, horarioInicio, fi + 1);
+    var otimizados = otRes.pontos;
+    totalTrocas2opt += otRes.trocas2opt.length;
 
     // 5. Calcula tempos reais entre paradas (sem reotimizar)
     var legs = [];
@@ -580,6 +718,10 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
       reservas: reservasFinais,
       paxClustering: fatia.pax
     });
+  }
+
+  if (typeof console !== "undefined" && totalTrocas2opt > 0) {
+    console.log("✨ 2-opt aplicou " + totalTrocas2opt + " troca(s) no total");
   }
 
   // 7. Falhos: coloca na última van
@@ -776,7 +918,8 @@ export default function App() {
       var reservasDest = rotaDestino.reservas.concat([movido]);
 
       // Só reotimiza a rota destino (mais barato em chamadas Google)
-      var otimizados = await otimizarVan(reservasDest, tourAtual.vetor, horarioEf);
+      var otRes = await otimizarVan(reservasDest, tourAtual.vetor, horarioEf, target + 1);
+      var otimizados = otRes.pontos;
       var ptsLeg = otimizados.filter(function (r) { return r.lat; }).map(function (r) { return { lat: r.lat, lng: r.lng }; });
       var legs = [];
       if (ptsLeg.length >= 2) {
@@ -857,7 +1000,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0 · Clustering Geográfico</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.1 · 2-opt + Eixo Adaptativo</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -979,9 +1122,9 @@ export default function App() {
                   <div style={styles.emptyMark}>∅</div>
                   <div>Aguardando entrada.</div>
                   <div style={styles.emptyHint}>
-                    v7.0: ordena por longitude no vetor do tour,<br />
+                    v7.1: ordena no eixo dominante (lat ou lng) do cluster,<br />
                     divide em fatias balanceadas respeitando capacidade,<br />
-                    otimiza cada van separadamente no Google.
+                    otimiza via Google + 2-opt local pra reduzir km.
                   </div>
                 </div>
               )}
@@ -1115,7 +1258,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0 · Clustering Geográfico</span>
+        <span>WeLoveChile · v7.1 · 2-opt + Eixo Adaptativo</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
