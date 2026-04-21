@@ -402,79 +402,49 @@ async function processarRotaB3(reservas, vetor, horarioInicio, cache, onProgress
   } else {
     // Estratégia: testamos VÁRIOS candidatos de origem/destino (pares de extremos)
     // e ficamos com o de menor duração total. Se o resultado vier no sentido inverso
-    // ao vetor desejado, invertemos a rota (manter otimizada).
     if (onProgress) onProgress("Otimizando rota (" + ok.length + " paradas) via Google...");
 
     var porLng = ok.slice().sort(function (a, b) { return a.lng - b.lng; });
-    var porLat = ok.slice().sort(function (a, b) { return a.lat - b.lat; });
 
-    // Candidatos de par origem-destino:
-    // - Rotas pequenas (<=8 pontos): testa TODAS as combinações (N*(N-1)/2 pares)
-    // - Rotas médias (9-15 pontos): testa 4 pares de extremos
-    // - Rotas grandes (>15): testa só 2 pares (economia)
-    var paresCandidatos = [];
-    if (ok.length <= 8) {
-      // Todas as combinações possíveis
-      for (var i1 = 0; i1 < ok.length; i1++) {
-        for (var j1 = 0; j1 < ok.length; j1++) {
-          if (i1 !== j1) paresCandidatos.push([ok[i1], ok[j1]]);
-        }
-      }
-    } else if (ok.length <= 15) {
-      paresCandidatos = [
-        [porLng[0], porLng[porLng.length - 1]],
-        [porLat[0], porLat[porLat.length - 1]],
-        [porLng[0], porLat[porLat.length - 1]],
-        [porLng[porLng.length - 1], porLat[0]]
-      ];
-    } else {
-      paresCandidatos = [
-        [porLng[0], porLng[porLng.length - 1]],
-        [porLat[0], porLat[porLat.length - 1]]
-      ];
+    // Lógica SIMPLES: força origem no extremo oeste (ou leste, se vetor oeste/sul)
+    // e destino no oposto. Deixa o Google otimizar o meio. SEM pontuação, SEM inversão.
+    var entrada = ascendente ? porLng[0] : porLng[porLng.length - 1];
+    var saida = ascendente ? porLng[porLng.length - 1] : porLng[0];
+    var meio = ok.filter(function (r) { return r !== entrada && r !== saida; });
+
+    var pts = [{ lat: entrada.lat, lng: entrada.lng }]
+      .concat(meio.map(function (r) { return { lat: r.lat, lng: r.lng }; }))
+      .concat([{ lat: saida.lat, lng: saida.lng }]);
+
+    // DEBUG: loga inputs
+    if (typeof console !== "undefined") {
+      console.log("=== DEBUG ROTA ===");
+      console.log("Vetor:", vetor, "| Ascendente:", ascendente);
+      console.log("Total pontos:", ok.length);
+      console.log("ENTRADA forçada:", entrada.endereco, "lng=" + entrada.lng.toFixed(4));
+      console.log("SAÍDA forçada:", saida.endereco, "lng=" + saida.lng.toFixed(4));
+      console.log("Meio (" + meio.length + "):", meio.map(function (m) { return m.endereco + " lng=" + m.lng.toFixed(4); }));
     }
 
-    // Remove pares inválidos (mesmos pontos)
-    paresCandidatos = paresCandidatos.filter(function (p) { return p[0] !== p[1]; });
+    var rotaOtim = await otimizarRotaEmPedacos(pts, horarioInicio);
 
-    var melhorResultado = null;
-    var melhorScore = Infinity;
-
-    for (var c = 0; c < paresCandidatos.length; c++) {
-      var a = paresCandidatos[c][0];
-      var b = paresCandidatos[c][1];
-      var meio = ok.filter(function (r) { return r !== a && r !== b; });
-
-      var pts = [{ lat: a.lat, lng: a.lng }]
-        .concat(meio.map(function (r) { return { lat: r.lat, lng: r.lng }; }))
-        .concat([{ lat: b.lat, lng: b.lng }]);
-
-      var rotaOtim = await otimizarRotaEmPedacos(pts, horarioInicio);
-      if (rotaOtim.erro) continue;
-
-      var duracao = (rotaOtim.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
-      var todos = [a].concat(meio).concat([b]);
-      var ordemCandidata = rotaOtim.ordem.map(function (i) { return todos[i]; });
-
-      // Score = duração + penalidade por voltas + penalidade por sentido invertido
-      var score = pontuarRota(ordemCandidata, duracao, vetor);
-
-      if (score < melhorScore) {
-        melhorScore = score;
-        melhorResultado = ordemCandidata;
-      }
-    }
-
-    if (melhorResultado) {
-      // Verifica sentido e inverte se necessário (backup caso pontuação não tenha filtrado)
-      var primeiro = melhorResultado[0];
-      var ultimo = melhorResultado[melhorResultado.length - 1];
-      var sentidoOK = ascendente ? (primeiro.lng <= ultimo.lng) : (primeiro.lng >= ultimo.lng);
-      ordenadosFinal = sentidoOK ? melhorResultado : melhorResultado.slice().reverse();
-    } else {
+    if (rotaOtim.erro) {
+      if (typeof console !== "undefined") console.warn("Routes erro:", rotaOtim.erro, "- usando fallback por longitude");
       ordenadosFinal = ok.slice().sort(function (a, b) {
         return ascendente ? a.lng - b.lng : b.lng - a.lng;
       });
+    } else {
+      var todos = [entrada].concat(meio).concat([saida]);
+      ordenadosFinal = rotaOtim.ordem.map(function (i) { return todos[i]; });
+
+      if (typeof console !== "undefined") {
+        var duracaoTotal = (rotaOtim.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
+        console.log("RESULTADO do Google (" + Math.round(duracaoTotal / 60) + " min total):");
+        ordenadosFinal.forEach(function (r, i) {
+          console.log("  " + (i + 1) + ". " + r.endereco + " | setor=" + r.setor + " lng=" + r.lng.toFixed(4));
+        });
+        console.log("=================");
+      }
     }
   }
 
@@ -635,9 +605,96 @@ export default function App() {
     }
   }
 
-  // Drag & drop
+  // Drag & drop: suporta (1) arrastar entre rotas e (2) reordenar dentro da mesma rota
   function onDragStart(rId, rotaIdx) { setDragging({ rId: rId, rotaIdx: rotaIdx }); }
   function onDragOver(e) { e.preventDefault(); }
+
+  // Drop em uma parada específica (reordenação interna OU movimento entre rotas com posição)
+  async function onDropParada(targetRotaIdx, targetReservaId, e) {
+    if (e) { e.stopPropagation(); e.preventDefault(); }
+    if (!dragging) return;
+    if (dragging.rId === targetReservaId) { setDragging(null); return; }
+
+    if (dragging.rotaIdx === targetRotaIdx) {
+      // ====== CASO A: Reordenação dentro da mesma rota ======
+      setProcessando(true);
+      setStatusMsg("Reordenando e recalculando tempos...");
+
+      try {
+        var rotaOriginal = resultado.rotas[targetRotaIdx];
+        var reservas = rotaOriginal.reservas.slice();
+        var fromIdx = reservas.findIndex(function (x) { return x.id === dragging.rId; });
+        var toIdx = reservas.findIndex(function (x) { return x.id === targetReservaId; });
+        if (fromIdx === -1 || toIdx === -1) { setDragging(null); setProcessando(false); return; }
+
+        var movido = reservas.splice(fromIdx, 1)[0];
+        reservas.splice(toIdx, 0, movido);
+
+        // Recalcula SÓ tempos reais com Google Routes (sem otimizar, respeita ordem manual)
+        var ptsOk = reservas.filter(function (r) { return r.lat; }).map(function (r) { return { lat: r.lat, lng: r.lng }; });
+        var novasLegs = [];
+        if (ptsOk.length >= 2) {
+          try {
+            var rsp = await fetch("/api/routes", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ points: ptsOk, optimize: false, departureTime: horarioEf })
+            });
+            if (rsp.ok) {
+              var td = await rsp.json();
+              novasLegs = td.legs || [];
+            }
+          } catch (_) {}
+        }
+
+        // Aplica horários
+        var horarios = [], deslocs = [];
+        var legIdx = 0;
+        for (var i = 0; i < reservas.length; i++) {
+          if (i === 0) { horarios[i] = horarioEf; deslocs[i] = 0; }
+          else {
+            var min;
+            var at = reservas[i], an = reservas[i - 1];
+            if (at.lat && an.lat && novasLegs[legIdx]) {
+              min = arredondar5(novasLegs[legIdx].durationSec / 60 + 1.5);
+              legIdx++;
+            } else if (at.lat && an.lat) {
+              min = tempoEstimadoMin(an, at);
+            } else { min = 10; }
+            deslocs[i] = min;
+            horarios[i] = somarMinutos(horarios[i - 1], min);
+          }
+        }
+
+        var reservasNew = reservas.map(function (r, i) {
+          return { ...r, horario: horarios[i], deslocamentoMin: deslocs[i] };
+        });
+
+        var tp = reservasNew.reduce(function (s, r) { return s + r.passageiros; }, 0);
+        var rotaNova = {
+          van: rotaOriginal.van,
+          reservas: reservasNew,
+          totalPax: tp,
+          excesso: tp > rotaOriginal.van.capacidade,
+          linkMaps: linkMaps(reservasNew)
+        };
+
+        var novasRotas = resultado.rotas.slice();
+        novasRotas[targetRotaIdx] = rotaNova;
+        setResultado({ rotas: novasRotas });
+        setStatusMsg("");
+      } catch (e) {
+        setStatusMsg("Erro ao reordenar: " + e.message);
+      } finally {
+        setProcessando(false);
+        setDragging(null);
+      }
+    } else {
+      // ====== CASO B: Movimento entre rotas ======
+      // (Delega pro onDrop padrão que reprocessa a rota destino)
+      await onDrop(targetRotaIdx);
+    }
+  }
+
   async function onDrop(target) {
     if (!dragging || dragging.rotaIdx === target) { setDragging(null); return; }
     setProcessando(true);
@@ -695,7 +752,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.7 · Google Maps</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v5.8 · Debug + Drag Interno</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -846,8 +903,16 @@ export default function App() {
                         <div style={styles.paradas}>
                           {rota.reservas.map(function (r, i) {
                             var unif = r.origens && r.origens.length > 1;
+                            var isDragTarget = dragging && dragging.rId !== r.id;
                             return (
-                              <div key={r.id} draggable onDragStart={function () { onDragStart(r.id, idx); }} style={styles.parada}>
+                              <div
+                                key={r.id}
+                                draggable
+                                onDragStart={function () { onDragStart(r.id, idx); }}
+                                onDragOver={onDragOver}
+                                onDrop={function (e) { onDropParada(idx, r.id, e); }}
+                                style={isDragTarget ? styles.paradaDragTarget : styles.parada}
+                              >
                                 <div style={styles.pDrag}>⋮⋮</div>
                                 <div style={styles.pNum}>{i + 1}</div>
                                 <div style={styles.pHora}>{r.horario}</div>
