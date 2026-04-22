@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from "react";
 import { styles } from "./styles.js";
 
 // ============================================================
-// WeLoveChile Route Dispatcher v7.0.1 (v7.0 + Inversão de Sentido)
+// WeLoveChile Route Dispatcher v7.0.3 (v7.0 + Inversão + Sistema simplificado de 2 pickups)
 //
 // MUDANÇA vs v7.0:
 //  - Cada tour pode ter sentido invertido por padrão (configurável)
@@ -14,21 +14,24 @@ import { styles } from "./styles.js";
 // como "sentido invertido por padrão" e/ou inverter pontualmente.
 // ============================================================
 
+// Sistema simplificado: pickup só pode ser "leste" (oeste→leste) ou "oeste" (leste→oeste)
+// Tours pro norte/nordeste/sudeste mapeiam pra "leste" (saída da cidade pelo lado leste)
+// Tours pro sul/sudoeste/noroeste mapeiam pra "oeste" (saída pelo lado oeste/sul)
 var TOURS_DEFAULT = [
   { nome: "Valle Nevado", horario: "05:00", vetor: "leste", invertido: false },
   { nome: "Farellones", horario: "06:00", vetor: "leste", invertido: false },
   { nome: "El Colorado", horario: "05:00", vetor: "leste", invertido: false },
-  { nome: "Astronómico Santiago", horario: "14:30", vetor: "sudeste", invertido: false },
-  { nome: "Concha y Toro", horario: "07:00", vetor: "sul", invertido: false },
+  { nome: "Astronómico Santiago", horario: "14:30", vetor: "leste", invertido: false },
+  { nome: "Concha y Toro", horario: "07:00", vetor: "oeste", invertido: false },
   { nome: "Cousiño Macul", horario: "12:00", vetor: "leste", invertido: false },
-  { nome: "Embalse El Yeso", horario: "05:00", vetor: "sudeste", invertido: false },
+  { nome: "Embalse El Yeso", horario: "05:00", vetor: "leste", invertido: false },
   { nome: "Isla Negra", horario: "07:30", vetor: "oeste", invertido: false },
-  { nome: "Parque Safari", horario: "07:30", vetor: "sul", invertido: false },
-  { nome: "Portillo", horario: "05:00", vetor: "norte", invertido: false },
-  { nome: "Santa Rita", horario: "08:00", vetor: "sul", invertido: false },
-  { nome: "El Principal", horario: "14:00", vetor: "sul", invertido: false },
-  { nome: "Termas da Colina", horario: "05:00", vetor: "sudeste", invertido: false },
-  { nome: "Transporte Alyan", horario: "14:30", vetor: "sul", invertido: false },
+  { nome: "Parque Safari", horario: "07:30", vetor: "oeste", invertido: false },
+  { nome: "Portillo", horario: "05:00", vetor: "leste", invertido: false },
+  { nome: "Santa Rita", horario: "08:00", vetor: "oeste", invertido: false },
+  { nome: "El Principal", horario: "14:00", vetor: "oeste", invertido: false },
+  { nome: "Termas da Colina", horario: "05:00", vetor: "leste", invertido: false },
+  { nome: "Transporte Alyan", horario: "14:30", vetor: "oeste", invertido: false },
   { nome: "Undurraga", horario: "07:30", vetor: "oeste", invertido: false },
   { nome: "Valparaíso", horario: "06:30", vetor: "oeste", invertido: false }
 ];
@@ -41,20 +44,20 @@ var TIPOS_VAN_DEFAULT = [
 
 // ============================================================
 // VETORES E INVERSÃO
+// Sistema simplificado: só "leste" e "oeste" como pickup direction.
 // ============================================================
-var VETOR_OPOSTO = {
-  "leste": "oeste",
-  "oeste": "leste",
-  "norte": "sul",
-  "sul": "norte",
-  "sudeste": "noroeste",
-  "noroeste": "sudeste",
-  "nordeste": "sudoeste",
-  "sudoeste": "nordeste"
-};
-
 function inverterVetor(vetor) {
-  return VETOR_OPOSTO[vetor] || vetor;
+  return vetor === "leste" ? "oeste" : "leste";
+}
+
+// Migração: vetores antigos (norte/sul/sudeste/etc) viram leste ou oeste
+function migrarVetorAntigo(vetor) {
+  // norte/nordeste/sudeste/leste → "leste" (saída pelo lado leste/cordilheira)
+  // sul/sudoeste/noroeste/oeste → "oeste" (saída pelo lado oeste/costa)
+  if (vetor === "leste" || vetor === "oeste") return vetor;
+  if (vetor === "norte" || vetor === "nordeste" || vetor === "sudeste") return "leste";
+  if (vetor === "sul" || vetor === "sudoeste" || vetor === "noroeste") return "oeste";
+  return "leste"; // default
 }
 
 // Persistência da config dos tours em localStorage
@@ -64,13 +67,14 @@ function carregarTours() {
     var raw = localStorage.getItem(TOURS_KEY);
     if (!raw) return TOURS_DEFAULT;
     var saved = JSON.parse(raw);
-    // Merge com default (caso novos tours sejam adicionados)
+    // Merge com default (caso novos tours sejam adicionados) + migração de vetor
     return TOURS_DEFAULT.map(function (def) {
       var found = saved.find(function (s) { return s.nome === def.nome; });
       if (found) {
         return {
           nome: def.nome,
-          vetor: def.vetor,
+          // Usa o vetor salvo SE ele já for novo formato; senão migra
+          vetor: migrarVetorAntigo(found.vetor || def.vetor),
           horario: found.horario || def.horario,
           invertido: !!found.invertido
         };
@@ -103,7 +107,9 @@ function nomeSetor(setor) {
 }
 
 function ascendentePorVetor(vetor) {
-  return (vetor === "leste" || vetor === "norte" || vetor === "sudeste" || vetor === "nordeste");
+  // pickup leste = oeste→leste = ordem ascendente de longitude
+  // pickup oeste = leste→oeste = ordem descendente
+  return vetor === "leste";
 }
 
 // ============================================================
@@ -251,6 +257,20 @@ async function otimizarVan(pontosVan, vetor, horarioPartida) {
 
   if (ok.length === 2) {
     return [entrada, saida].concat(falhos);
+  }
+
+  // ============================================================
+  // CASO ESPECIAL: 3 pontos (1 intermediário)
+  // Com origem/destino fixos pelo pickup, só existe UMA ordem possível:
+  // entrada → meio → saída. Não precisa chamar Google pra otimizar.
+  // (Google nem otimizaria com 1 intermediário e estava causando bugs)
+  // ============================================================
+  if (ok.length === 3) {
+    var meioPt = ok.filter(function (p) { return p !== entrada && p !== saida; })[0];
+    if (typeof console !== "undefined") {
+      console.log("Van 3 pts (sem otimização Google): " + entrada.endereco + " → " + meioPt.endereco + " → " + saida.endereco);
+    }
+    return [entrada, meioPt, saida].concat(falhos);
   }
 
   var meio = ok.filter(function (p) { return p !== entrada && p !== saida; });
@@ -970,7 +990,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.2 · Bug Fix</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.3 · Pickup leste/oeste</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1119,7 +1139,7 @@ export default function App() {
                   <div style={styles.emptyMark}>∅</div>
                   <div>Aguardando entrada.</div>
                   <div style={styles.emptyHint}>
-                    v7.0.1: ordena por longitude no vetor do tour,<br />
+                    v7.0.3: pickup só leste ou oeste,<br />
                     divide em fatias balanceadas respeitando capacidade,<br />
                     otimiza cada van separadamente no Google.<br />
                     <span style={{ color: "#fab43c" }}>↔ Sentido configurável por tour ou pontual</span>
@@ -1283,7 +1303,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0.2 · Bug Fix (1 intermediário)</span>
+        <span>WeLoveChile · v7.0.3 · Pickup leste/oeste</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
