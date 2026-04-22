@@ -2,37 +2,35 @@ import React, { useState, useMemo, useEffect } from "react";
 import { styles } from "./styles.js";
 
 // ============================================================
-// WeLoveChile Route Dispatcher v7.0 (Clustering geográfico + Otimização Google)
+// WeLoveChile Route Dispatcher v7.0.1 (v7.0 + Inversão de Sentido)
 //
-// MUDANÇA PRINCIPAL vs v6.0:
-//   ANTES: 1) otimiza todos juntos no Google  2) fatia por capacidade
-//   AGORA: 1) ordena por longitude  2) fatia balanceada respeitando capacidade
-//          3) otimiza CADA VAN separadamente no Google
+// MUDANÇA vs v7.0:
+//  - Cada tour pode ter sentido invertido por padrão (configurável)
+//  - Cada geração pode invertir pontualmente (override do padrão)
+//  - Padrão dos tours salvo em localStorage
 //
-// Vantagens:
-//  - Cada van vira um trecho geograficamente coerente do vetor do tour
-//  - Balanceamento ótimo de pax entre vans (minimiza max-min)
-//  - Menos chamadas à Routes API (1 por van pequena ao invés de 1 gigante + chunks)
-//  - Fallback automático com relaxamento quando contiguidade estrita é inviável
+// Caso de uso: motoristas de Concha y Toro / Santa Rita moram no oeste,
+// não faz sentido começar no leste. Joaquim agora pode marcar tours
+// como "sentido invertido por padrão" e/ou inverter pontualmente.
 // ============================================================
 
 var TOURS_DEFAULT = [
-  { nome: "Valle Nevado", horario: "05:00", vetor: "leste" },
-  { nome: "Farellones", horario: "06:00", vetor: "leste" },
-  { nome: "El Colorado", horario: "05:00", vetor: "leste" },
-  { nome: "Astronómico Santiago", horario: "14:30", vetor: "sudeste" },
-  { nome: "Concha y Toro", horario: "07:00", vetor: "sul" },
-  { nome: "Cousiño Macul", horario: "12:00", vetor: "leste" },
-  { nome: "Embalse El Yeso", horario: "05:00", vetor: "sudeste" },
-  { nome: "Isla Negra", horario: "07:30", vetor: "oeste" },
-  { nome: "Parque Safari", horario: "07:30", vetor: "sul" },
-  { nome: "Portillo", horario: "05:00", vetor: "norte" },
-  { nome: "Santa Rita", horario: "08:00", vetor: "sul" },
-  { nome: "El Principal", horario: "14:00", vetor: "sul" },
-  { nome: "Termas da Colina", horario: "05:00", vetor: "sudeste" },
-  { nome: "Transporte Alyan", horario: "14:30", vetor: "sul" },
-  { nome: "Undurraga", horario: "07:30", vetor: "oeste" },
-  { nome: "Valparaíso", horario: "06:30", vetor: "oeste" }
+  { nome: "Valle Nevado", horario: "05:00", vetor: "leste", invertido: false },
+  { nome: "Farellones", horario: "06:00", vetor: "leste", invertido: false },
+  { nome: "El Colorado", horario: "05:00", vetor: "leste", invertido: false },
+  { nome: "Astronómico Santiago", horario: "14:30", vetor: "sudeste", invertido: false },
+  { nome: "Concha y Toro", horario: "07:00", vetor: "sul", invertido: false },
+  { nome: "Cousiño Macul", horario: "12:00", vetor: "leste", invertido: false },
+  { nome: "Embalse El Yeso", horario: "05:00", vetor: "sudeste", invertido: false },
+  { nome: "Isla Negra", horario: "07:30", vetor: "oeste", invertido: false },
+  { nome: "Parque Safari", horario: "07:30", vetor: "sul", invertido: false },
+  { nome: "Portillo", horario: "05:00", vetor: "norte", invertido: false },
+  { nome: "Santa Rita", horario: "08:00", vetor: "sul", invertido: false },
+  { nome: "El Principal", horario: "14:00", vetor: "sul", invertido: false },
+  { nome: "Termas da Colina", horario: "05:00", vetor: "sudeste", invertido: false },
+  { nome: "Transporte Alyan", horario: "14:30", vetor: "sul", invertido: false },
+  { nome: "Undurraga", horario: "07:30", vetor: "oeste", invertido: false },
+  { nome: "Valparaíso", horario: "06:30", vetor: "oeste", invertido: false }
 ];
 
 var TIPOS_VAN_DEFAULT = [
@@ -40,6 +38,52 @@ var TIPOS_VAN_DEFAULT = [
   { id: "t10", capacidade: 10 }, { id: "t15", capacidade: 15 },
   { id: "t18", capacidade: 18 }, { id: "t19", capacidade: 19 }
 ];
+
+// ============================================================
+// VETORES E INVERSÃO
+// ============================================================
+var VETOR_OPOSTO = {
+  "leste": "oeste",
+  "oeste": "leste",
+  "norte": "sul",
+  "sul": "norte",
+  "sudeste": "noroeste",
+  "noroeste": "sudeste",
+  "nordeste": "sudoeste",
+  "sudoeste": "nordeste"
+};
+
+function inverterVetor(vetor) {
+  return VETOR_OPOSTO[vetor] || vetor;
+}
+
+// Persistência da config dos tours em localStorage
+var TOURS_KEY = "wlc_tours_v1";
+function carregarTours() {
+  try {
+    var raw = localStorage.getItem(TOURS_KEY);
+    if (!raw) return TOURS_DEFAULT;
+    var saved = JSON.parse(raw);
+    // Merge com default (caso novos tours sejam adicionados)
+    return TOURS_DEFAULT.map(function (def) {
+      var found = saved.find(function (s) { return s.nome === def.nome; });
+      if (found) {
+        return {
+          nome: def.nome,
+          vetor: def.vetor,
+          horario: found.horario || def.horario,
+          invertido: !!found.invertido
+        };
+      }
+      return def;
+    });
+  } catch (e) {
+    return TOURS_DEFAULT;
+  }
+}
+function salvarTours(tours) {
+  try { localStorage.setItem(TOURS_KEY, JSON.stringify(tours)); } catch (e) {}
+}
 
 function setorPorCoordenadas(lat, lng) {
   if (!lat || !lng) return 99;
@@ -296,7 +340,7 @@ function expandirVans(tipos, ativos) {
 }
 
 // ============================================================
-// ALGORITMO NOVO: CLUSTERING GEOGRÁFICO BALANCEADO
+// ALGORITMO: CLUSTERING GEOGRÁFICO BALANCEADO
 // ============================================================
 
 function prefixSumPax(pontos) {
@@ -306,7 +350,6 @@ function prefixSumPax(pontos) {
 }
 function paxIntervalo(pref, i, j) { return pref[j] - pref[i]; }
 
-// Calcula quantas vans são necessárias, começando pelas maiores
 function calcularVansNecessarias(totalPax, vansDisponiveis) {
   var sorted = vansDisponiveis.slice().sort(function (a, b) { return b.capacidade - a.capacidade; });
   var soma = 0;
@@ -317,7 +360,6 @@ function calcularVansNecessarias(totalPax, vansDisponiveis) {
   return sorted.length;
 }
 
-// Particionamento contíguo ótimo respeitando capacidade. Retorna null se inviável.
 function particionarContiguoViavel(pontosOrd, vansSel) {
   var n = pontosOrd.length;
   var k = vansSel.length;
@@ -359,7 +401,6 @@ function particionarContiguoViavel(pontosOrd, vansSel) {
   return { tipo: "contiguo", fatias: fatias, dif: melhor.dif };
 }
 
-// Particionamento ótimo IGNORANDO capacidade (só minimiza desbalanceamento)
 function particionarOtimoSemCap(pontosOrd, k) {
   var n = pontosOrd.length;
   var pref = prefixSumPax(pontosOrd);
@@ -385,8 +426,6 @@ function particionarOtimoSemCap(pontosOrd, k) {
   return melhor;
 }
 
-// Fallback: quando contiguidade estrita é inviável, relaxa movendo pontos individuais
-// de fatias com excesso pra fatias com folga, minimizando distorção geográfica
 function particionarComRelaxamento(pontosOrd, vansSel) {
   var k = vansSel.length;
   var otimo = particionarOtimoSemCap(pontosOrd, k);
@@ -445,13 +484,11 @@ function particionarComRelaxamento(pontosOrd, vansSel) {
   return { tipo: "relaxado", fatias: fatias, dif: dif };
 }
 
-// Seleciona as K vans a usar (K maiores), particiona, retorna resultado
 function clusterizarPorVans(pontosOrd, vansDisponiveis) {
   var totalPax = pontosOrd.reduce(function (s, p) { return s + p.passageiros; }, 0);
   var K = calcularVansNecessarias(totalPax, vansDisponiveis);
   var vansSel = vansDisponiveis.slice().sort(function (a, b) { return b.capacidade - a.capacidade; }).slice(0, K);
 
-  // Tenta permutações se capacidades diferem (fatorial até K=7)
   var todasIguais = vansSel.every(function (v) { return v.capacidade === vansSel[0].capacidade; });
 
   var melhor = null;
@@ -486,7 +523,6 @@ function permutacoes(arr) {
 // PIPELINE PRINCIPAL V7
 // ============================================================
 async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDisponiveis, onProgress) {
-  // 1. Geocodifica
   var enriquecidos = [];
   for (var i = 0; i < reservas.length; i++) {
     if (onProgress) onProgress("Geocodificando " + (i + 1) + "/" + reservas.length + ": " + reservas[i].endereco);
@@ -502,7 +538,6 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
     return { fatiasComRota: [{ van: vansDisponiveis[0] || { capacidade: 0, nome: "?" }, reservas: falhos }], tipoParticao: "vazio" };
   }
 
-  // 2. Ordena por longitude no vetor
   var ascendente = ascendentePorVetor(vetor);
   var ordenados = ok.slice().sort(function (a, b) {
     return ascendente ? a.lng - b.lng : b.lng - a.lng;
@@ -510,17 +545,15 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
 
   if (typeof console !== "undefined") {
     console.log("=== V7 PIPELINE ===");
-    console.log("Vetor:", vetor, "| Ascendente:", ascendente);
+    console.log("Vetor aplicado:", vetor, "| Ascendente:", ascendente);
     console.log("Pontos geocodificados:", ok.length, "| Falhos:", falhos.length);
     console.log("Vans disponíveis:", vansDisponiveis.map(function (v) { return v.capacidade; }).join(","));
   }
 
-  // 3. Clusteriza em vans
   if (onProgress) onProgress("Dividindo " + ok.length + " paradas em vans...");
   var clusterResult = clusterizarPorVans(ordenados, vansDisponiveis);
 
   if (!clusterResult) {
-    // Capacidade insuficiente — joga tudo na primeira van como erro visível
     return {
       fatiasComRota: [{ van: vansDisponiveis[0], reservas: ordenados.concat(falhos) }],
       tipoParticao: "erro_capacidade"
@@ -534,7 +567,6 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
     });
   }
 
-  // 4. Otimiza cada van separadamente no Google
   var fatiasComRota = [];
   for (var fi = 0; fi < clusterResult.fatias.length; fi++) {
     var fatia = clusterResult.fatias[fi];
@@ -542,7 +574,6 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
 
     var otimizados = await otimizarVan(fatia.pontos, vetor, horarioInicio);
 
-    // 5. Calcula tempos reais entre paradas (sem reotimizar)
     var legs = [];
     var ptsLeg = otimizados.filter(function (r) { return r.lat; }).map(function (r) { return { lat: r.lat, lng: r.lng }; });
     if (ptsLeg.length >= 2) {
@@ -550,7 +581,6 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
       if (!rl.erro) legs = rl.legs || [];
     }
 
-    // 6. Aplica horários
     var horarios = [], deslocs = [];
     var idxLeg = 0;
     for (var j = 0; j < otimizados.length; j++) {
@@ -582,7 +612,6 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
     });
   }
 
-  // 7. Falhos: coloca na última van
   if (falhos.length > 0 && fatiasComRota.length > 0) {
     var ultima = fatiasComRota[fatiasComRota.length - 1];
     var horarioFim = ultima.reservas.length > 0 ? ultima.reservas[ultima.reservas.length - 1].horario : horarioInicio;
@@ -625,11 +654,25 @@ export default function App() {
   var [abaConfig, setAbaConfig] = useState(false);
   var [cache, setCache] = useState({});
   var [dragging, setDragging] = useState(null);
+  // Inversão pontual: null = usa padrão do tour | true/false = override pontual
+  var [invertirPontual, setInvertirPontual] = useState(null);
 
-  useEffect(function () { setCache(carregarCache()); }, []);
+  useEffect(function () {
+    setCache(carregarCache());
+    setTours(carregarTours());
+  }, []);
+
+  // Quando o tour muda, reseta a inversão pontual (volta ao padrão do tour)
+  useEffect(function () {
+    setInvertirPontual(null);
+  }, [tourSel]);
 
   var tourAtual = tours.find(function (t) { return t.nome === tourSel; }) || tours[0];
   var horarioEf = horarioCustom || tourAtual.horario;
+  // Vetor efetivo: se houver override pontual, usa ele; senão, usa o padrão do tour
+  var invertidoEfetivo = invertirPontual !== null ? invertirPontual : !!tourAtual.invertido;
+  var vetorEfetivo = invertidoEfetivo ? inverterVetor(tourAtual.vetor) : tourAtual.vetor;
+
   var vansExp = useMemo(function () { return expandirVans(tiposVan, vansAtivas); }, [tiposVan, vansAtivas]);
   var totalPax = reservas.reduce(function (s, r) { return s + r.passageiros; }, 0);
   var totalCap = vansExp.reduce(function (s, v) { return s + v.capacidade; }, 0);
@@ -651,10 +694,27 @@ export default function App() {
   }
   function limparTudo() {
     setColagem(""); setReservas([]); setResultado(null); setHorarioCustom(""); setVansAtivas({});
+    setInvertirPontual(null);
   }
   function limparCache() {
     if (confirm("Limpar cache de geocoding?")) {
       localStorage.removeItem(CACHE_KEY); setCache({}); alert("Cache limpo.");
+    }
+  }
+  function toggleInversaoTour(nomeTour) {
+    var novos = tours.map(function (t) {
+      if (t.nome !== nomeTour) return t;
+      return { ...t, invertido: !t.invertido };
+    });
+    setTours(novos);
+    salvarTours(novos);
+  }
+  function toggleInversaoPontual() {
+    // Cycle: null (padrão) -> oposto do padrão -> null
+    if (invertirPontual === null) {
+      setInvertirPontual(!tourAtual.invertido);
+    } else {
+      setInvertirPontual(null);
     }
   }
 
@@ -666,7 +726,7 @@ export default function App() {
 
     try {
       var unificadas = unificarReservas(reservas);
-      var resultado7 = await processarRotaV7(unificadas, tourAtual.vetor, horarioEf, cache, vansExp, setStatusMsg);
+      var resultado7 = await processarRotaV7(unificadas, vetorEfetivo, horarioEf, cache, vansExp, setStatusMsg);
 
       var rotasFinais = resultado7.fatiasComRota.map(function (fatia) {
         var totalPaxR = fatia.reservas.reduce(function (s, r) { return s + r.passageiros; }, 0);
@@ -682,7 +742,9 @@ export default function App() {
       setResultado({
         rotas: rotasFinais,
         tipoParticao: resultado7.tipoParticao,
-        dif: resultado7.dif
+        dif: resultado7.dif,
+        vetorAplicado: vetorEfetivo,
+        invertido: invertidoEfetivo
       });
       setStatusMsg("");
     } catch (e) {
@@ -702,7 +764,6 @@ export default function App() {
     if (dragging.rId === targetReservaId) { setDragging(null); return; }
 
     if (dragging.rotaIdx === targetRotaIdx) {
-      // Reordenação dentro da mesma rota
       setProcessando(true);
       setStatusMsg("Reordenando e recalculando tempos...");
       try {
@@ -775,8 +836,7 @@ export default function App() {
       var movido = resultado.rotas[dragging.rotaIdx].reservas.find(function (x) { return x.id === dragging.rId; });
       var reservasDest = rotaDestino.reservas.concat([movido]);
 
-      // Só reotimiza a rota destino (mais barato em chamadas Google)
-      var otimizados = await otimizarVan(reservasDest, tourAtual.vetor, horarioEf);
+      var otimizados = await otimizarVan(reservasDest, vetorEfetivo, horarioEf);
       var ptsLeg = otimizados.filter(function (r) { return r.lat; }).map(function (r) { return { lat: r.lat, lng: r.lng }; });
       var legs = [];
       if (ptsLeg.length >= 2) {
@@ -808,7 +868,6 @@ export default function App() {
         linkMaps: linkMaps(reservasNew)
       };
 
-      // Remove da origem e recalcula horários da origem (sem reotimizar)
       var reservasOrigem = resultado.rotas[dragging.rotaIdx].reservas.filter(function (x) { return x.id !== dragging.rId; });
       var horariosO = [], deslocsO = [];
       for (var jo = 0; jo < reservasOrigem.length; jo++) {
@@ -835,7 +894,6 @@ export default function App() {
       var novasRotas = resultado.rotas.slice();
       novasRotas[target] = rotaDestNova;
       novasRotas[dragging.rotaIdx] = rotaOrigNova;
-      // Remove rotas vazias
       novasRotas = novasRotas.filter(function (r) { return r.reservas.length > 0; });
 
       setResultado({ ...resultado, rotas: novasRotas });
@@ -848,6 +906,30 @@ export default function App() {
     }
   }
 
+  // Estilos inline pra elementos novos (não preciso mexer em styles.js)
+  var styleBtnInverter = {
+    padding: "4px 8px", fontSize: 10, background: "transparent",
+    border: "1px solid rgba(255,255,255,0.2)", color: "rgba(255,255,255,0.55)",
+    cursor: "pointer", borderRadius: 3, marginLeft: 6, fontFamily: "monospace"
+  };
+  var styleBtnInverterAtivo = {
+    ...styleBtnInverter, background: "rgba(250, 180, 60, 0.15)",
+    borderColor: "rgba(250, 180, 60, 0.5)", color: "#fab43c"
+  };
+  var styleVetorInvertido = {
+    fontSize: 10, padding: "2px 6px", borderRadius: 3,
+    background: "rgba(250, 180, 60, 0.15)", color: "#fab43c",
+    border: "1px solid rgba(250, 180, 60, 0.3)", fontFamily: "monospace"
+  };
+  var styleSentidoToggle = {
+    display: "flex", alignItems: "center", gap: 8, marginTop: 8,
+    padding: "8px 10px", borderRadius: 4,
+    background: invertidoEfetivo ? "rgba(250, 180, 60, 0.08)" : "rgba(255,255,255,0.03)",
+    border: "1px solid " + (invertidoEfetivo ? "rgba(250, 180, 60, 0.3)" : "rgba(255,255,255,0.08)"),
+    cursor: "pointer", fontSize: 12,
+    color: invertidoEfetivo ? "#fab43c" : "rgba(255,255,255,0.6)"
+  };
+
   return (
     <div style={styles.app}>
       <div style={styles.grain}></div>
@@ -857,7 +939,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0 · Clustering Geográfico</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.1 · Inversão de Sentido</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -874,7 +956,10 @@ export default function App() {
               <div style={styles.field}>
                 <label style={styles.label}>Tour</label>
                 <select value={tourSel} onChange={function (e) { setTourSel(e.target.value); setHorarioCustom(""); }} style={styles.select}>
-                  {tours.map(function (t) { return <option key={t.nome} value={t.nome}>{t.nome} · {t.horario} · {t.vetor}</option>; })}
+                  {tours.map(function (t) {
+                    var lbl = t.nome + " · " + t.horario + " · " + t.vetor + (t.invertido ? " (invertido)" : "");
+                    return <option key={t.nome} value={t.nome}>{lbl}</option>;
+                  })}
                 </select>
               </div>
               <div style={styles.fieldRow}>
@@ -888,8 +973,32 @@ export default function App() {
                 </div>
               </div>
               <div style={styles.meta}>
-                <span style={styles.chip}>vetor <strong>{tourAtual.vetor}</strong></span>
+                <span style={styles.chip}>
+                  vetor <strong>{vetorEfetivo}</strong>
+                  {invertidoEfetivo && <span style={{ marginLeft: 6, color: "#fab43c" }}>↔ invertido</span>}
+                </span>
                 <span style={styles.chipHL}>1ª parada: <strong>{horarioEf}</strong></span>
+              </div>
+
+              {/* Toggle de inversão pontual */}
+              <div style={styleSentidoToggle} onClick={toggleInversaoPontual}>
+                <input
+                  type="checkbox"
+                  checked={invertidoEfetivo}
+                  onChange={function () { }}
+                  style={{ cursor: "pointer", accentColor: "#fab43c" }}
+                />
+                <span style={{ flex: 1 }}>
+                  ↔ Inverter sentido desta rota
+                  {invertirPontual !== null && (
+                    <span style={{ marginLeft: 6, fontSize: 10, opacity: 0.7 }}>
+                      (override do padrão)
+                    </span>
+                  )}
+                </span>
+                <span style={{ fontSize: 10, opacity: 0.6 }}>
+                  padrão: {tourAtual.invertido ? inverterVetor(tourAtual.vetor) : tourAtual.vetor}
+                </span>
               </div>
             </div>
 
@@ -979,15 +1088,25 @@ export default function App() {
                   <div style={styles.emptyMark}>∅</div>
                   <div>Aguardando entrada.</div>
                   <div style={styles.emptyHint}>
-                    v7.0: ordena por longitude no vetor do tour,<br />
+                    v7.0.1: ordena por longitude no vetor do tour,<br />
                     divide em fatias balanceadas respeitando capacidade,<br />
-                    otimiza cada van separadamente no Google.
+                    otimiza cada van separadamente no Google.<br />
+                    <span style={{ color: "#fab43c" }}>↔ Sentido configurável por tour ou pontual</span>
                   </div>
                 </div>
               )}
 
               {resultado && (
                 <div>
+                  {resultado.invertido && (
+                    <div style={{
+                      padding: "8px 12px", marginBottom: 10,
+                      background: "rgba(250, 180, 60, 0.08)", border: "1px solid rgba(250, 180, 60, 0.25)",
+                      borderRadius: 4, fontSize: 11, color: "#fab43c"
+                    }}>
+                      ↔ Sentido invertido aplicado · vetor: {resultado.vetorAplicado}
+                    </div>
+                  )}
                   {resultado.tipoParticao === "relaxado" && (
                     <div style={{
                       padding: "10px 14px", marginBottom: 12,
@@ -1087,16 +1206,34 @@ export default function App() {
           </section>
 
           <section style={styles.panel}>
-            <div style={styles.pHead}><span style={styles.pNum}>◉</span><span style={styles.pTitle}>HORÁRIOS PADRÃO</span></div>
+            <div style={styles.pHead}><span style={styles.pNum}>◉</span><span style={styles.pTitle}>HORÁRIOS PADRÃO & SENTIDO</span></div>
+            <div style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", padding: "0 0 12px 0", lineHeight: 1.5 }}>
+              Clique no <strong style={{ color: "#fab43c" }}>↔</strong> ao lado do vetor pra inverter o sentido padrão de cada tour.
+              Útil quando os motoristas começam pelo lado oposto ao natural (ex: Concha y Toro saindo do oeste).
+            </div>
             <div style={styles.cfgList}>
               {tours.map(function (t, i) {
+                var vetorMostrado = t.invertido ? inverterVetor(t.vetor) : t.vetor;
                 return (
                   <div key={t.nome} style={styles.cfgRow}>
                     <div style={styles.tourNm}>{t.nome}</div>
                     <input style={styles.inputT} type="time" value={t.horario} onChange={function (e) {
-                      var n = tours.slice(); n[i] = { ...n[i], horario: e.target.value }; setTours(n);
+                      var n = tours.slice(); n[i] = { ...n[i], horario: e.target.value }; setTours(n); salvarTours(n);
                     }} />
-                    <span style={styles.vetCh}>{t.vetor}</span>
+                    {t.invertido ? (
+                      <span style={styleVetorInvertido}>
+                        {t.vetor} → <strong>{vetorMostrado}</strong>
+                      </span>
+                    ) : (
+                      <span style={styles.vetCh}>{t.vetor}</span>
+                    )}
+                    <button
+                      style={t.invertido ? styleBtnInverterAtivo : styleBtnInverter}
+                      onClick={function () { toggleInversaoTour(t.nome); }}
+                      title={t.invertido ? "Restaurar sentido padrão" : "Inverter sentido padrão"}
+                    >
+                      ↔ {t.invertido ? "invertido" : "inverter"}
+                    </button>
                   </div>
                 );
               })}
@@ -1115,7 +1252,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0 · Clustering Geográfico</span>
+        <span>WeLoveChile · v7.0.1 · Inversão de Sentido</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
