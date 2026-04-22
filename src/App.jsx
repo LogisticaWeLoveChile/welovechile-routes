@@ -309,7 +309,86 @@ async function otimizarVan(pontosVan, vetor, horarioPartida) {
     }
   });
 
+  // ============================================================
+  // REFINAMENTO KM vs TEMPO (conservador)
+  // Testa trocas de pares adjacentes no meio. Se encontrar variante
+  // com km menor e tempo não piorando mais que 3 min, aceita.
+  // Só roda quando há ≥4 pontos (≥2 intermediários) onde realmente há
+  // trocas possíveis. Custa (n-3) chamadas Google extras no pior caso.
+  // ============================================================
+  if (ordenadoLimpo.length >= 4) {
+    var refinamento = await refinarPorKm(ordenadoLimpo, r.legs, horarioPartida);
+    if (refinamento.mudou) {
+      if (typeof console !== "undefined") {
+        console.log("🔧 Refinamento km: trocou [" + refinamento.trocas.join(", ") +
+          "] | Δkm=" + refinamento.deltaKm.toFixed(2) + " Δmin=" + refinamento.deltaMin.toFixed(1));
+      }
+      return refinamento.rota.concat(falhos);
+    }
+  }
+
   return ordenadoLimpo.concat(falhos);
+}
+
+// ============================================================
+// REFINAMENTO POR KM: testa trocas de vizinhos no meio
+// ============================================================
+async function refinarPorKm(rota, legsOriginais, horarioPartida) {
+  var n = rota.length;
+  if (n < 4) return { mudou: false };
+
+  // Métricas da rota original (tempo e km)
+  var tempoOriginal = (legsOriginais || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
+  var kmOriginal = (legsOriginais || []).reduce(function (s, l) { return s + (l.distanceMeters || 0); }, 0);
+
+  // Se não tem legs original (não veio do Google), busca agora
+  if (!tempoOriginal || !kmOriginal) {
+    var ptsOrig = rota.map(function (p) { return { lat: p.lat, lng: p.lng }; });
+    var rOrig = await chamarRoutes(ptsOrig, horarioPartida, false);
+    if (rOrig.erro) return { mudou: false };
+    tempoOriginal = (rOrig.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
+    kmOriginal = (rOrig.legs || []).reduce(function (s, l) { return s + (l.distanceMeters || 0); }, 0);
+  }
+
+  // Testa trocas de vizinhos (i, i+1) para i em [1, n-2) — preserva origem (0) e destino (n-1)
+  var melhorVariante = null;
+  for (var i = 1; i < n - 2; i++) {
+    var variante = rota.slice();
+    var tmp = variante[i];
+    variante[i] = variante[i + 1];
+    variante[i + 1] = tmp;
+
+    var ptsVar = variante.map(function (p) { return { lat: p.lat, lng: p.lng }; });
+    var rVar = await chamarRoutes(ptsVar, horarioPartida, false);
+    if (rVar.erro) continue;
+
+    var tempoVar = (rVar.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
+    var kmVar = (rVar.legs || []).reduce(function (s, l) { return s + (l.distanceMeters || 0); }, 0);
+
+    var deltaKm = (kmVar - kmOriginal) / 1000; // em km
+    var deltaMin = (tempoVar - tempoOriginal) / 60; // em min
+
+    // Aceita se km menor E tempo não piora mais que 3 min
+    if (deltaKm < -0.1 && deltaMin < 3) {
+      if (!melhorVariante || deltaKm < melhorVariante.deltaKm) {
+        melhorVariante = {
+          rota: variante,
+          trocas: [rota[i].endereco + " ↔ " + rota[i + 1].endereco],
+          deltaKm: deltaKm,
+          deltaMin: deltaMin
+        };
+      }
+    }
+  }
+
+  if (!melhorVariante) return { mudou: false };
+  return {
+    mudou: true,
+    rota: melhorVariante.rota,
+    trocas: melhorVariante.trocas,
+    deltaKm: melhorVariante.deltaKm,
+    deltaMin: melhorVariante.deltaMin
+  };
 }
 
 // ============================================================
@@ -990,7 +1069,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.3 · Pickup leste/oeste</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.4 · Refinamento km</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1303,7 +1382,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0.3 · Pickup leste/oeste</span>
+        <span>WeLoveChile · v7.0.4 · Refinamento km</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
