@@ -205,9 +205,19 @@ async function chamarRoutes(pontos, horarioPartida, otimizar, tentativa) {
     var n = pontos.length;
     var ordem;
     if (otimizar) {
-      ordem = [0];
-      (data.optimizedOrder || []).forEach(function (i) { ordem.push(i + 1); });
-      ordem.push(n - 1);
+      // optimizedOrder vem da Google com os índices otimizados DOS INTERMEDIÁRIOS (0-indexed).
+      // BUG fix: quando há só 1 intermediário, Google não retorna o campo (não há nada pra
+      // otimizar). Nesse caso, mantemos a ordem natural: [0, 1, 2, ..., n-1].
+      var intermediariosReais = n - 2; // descontando origem e destino
+      var optimized = data.optimizedOrder;
+      if (!Array.isArray(optimized) || optimized.length !== intermediariosReais) {
+        // Sem otimização válida — mantém ordem original dos pontos enviados
+        ordem = pontos.map(function (_, i) { return i; });
+      } else {
+        ordem = [0];
+        optimized.forEach(function (i) { ordem.push(i + 1); });
+        ordem.push(n - 1);
+      }
     } else {
       ordem = pontos.map(function (_, i) { return i; });
     }
@@ -258,7 +268,28 @@ async function otimizarVan(pontosVan, vetor, horarioPartida) {
 
   var todos = [entrada].concat(meio).concat([saida]);
   var ordenado = r.ordem.map(function (i) { return todos[i]; });
-  return ordenado.concat(falhos);
+
+  // Proteção: se por algum motivo a ordem veio incompleta (faltando pontos)
+  // ou com duplicatas, fazemos merge defensivo com `todos` pra garantir
+  // que todos os pontos originais estejam presentes exatamente uma vez.
+  var presentes = {};
+  var ordenadoLimpo = [];
+  ordenado.forEach(function (p) {
+    if (p && !presentes[p.id]) {
+      presentes[p.id] = true;
+      ordenadoLimpo.push(p);
+    }
+  });
+  // Adiciona qualquer ponto que ficou de fora (bug no Google ou no parse)
+  todos.forEach(function (p) {
+    if (p && !presentes[p.id]) {
+      if (typeof console !== "undefined") console.warn("⚠️ Ponto faltante recuperado:", p.endereco);
+      presentes[p.id] = true;
+      ordenadoLimpo.push(p);
+    }
+  });
+
+  return ordenadoLimpo.concat(falhos);
 }
 
 // ============================================================
@@ -939,7 +970,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.1 · Inversão de Sentido</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.2 · Bug Fix</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1252,7 +1283,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0.1 · Inversão de Sentido</span>
+        <span>WeLoveChile · v7.0.2 · Bug Fix (1 intermediário)</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
