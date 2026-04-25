@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from "react";
 import { styles } from "./styles.js";
 
 // ============================================================
-// WeLoveChile Route Dispatcher v7.0.7 (v7.0.6 + 2-opt local em Haversine, sem otimização Google)
+// WeLoveChile Route Dispatcher v7.0.8 (v7.0.7 + Distance Matrix real + cache LRU 10k pares)
 //
 // MUDANÇA vs v7.0:
 //  - Cada tour pode ter sentido invertido por padrão (configurável)
@@ -277,34 +277,39 @@ async function otimizarVan(pontosVan, vetor, horarioPartida) {
   var meio = ok.filter(function (p) { return p !== entrada && p !== saida; });
 
   // ============================================================
-  // OTIMIZAÇÃO LOCAL VIA 2-OPT em cima de Haversine
+  // OTIMIZAÇÃO via 2-OPT em cima de matriz REAL de Distance Matrix
   //
-  // Não confiamos mais no Google pra otimizar a ordem porque ele otimiza
-  // por TEMPO (que com vias expressas vazias às 5am, dá voltas longas).
-  // Em vez disso:
-  //   1. Construímos rota inicial: entrada + meio (ord. por longitude) + saida
-  //   2. Aplicamos 2-opt completo: testa inverter qualquer subsequência [i..j]
-  //      do meio. Aceita se reduz custo Haversine total.
-  //   3. Resultado: ordem geograficamente coerente, sem voltas absurdas.
+  // Antes: 2-opt em Haversine (linha reta) — falha em casos com obstáculos
+  //        (rios, autopistas, mãos únicas) onde linha reta engana.
+  // Agora: pega matriz NxN de km REAIS via Google Distance Matrix, com cache.
+  //        2-opt opera sobre km reais por estrada. Sem chute geométrico.
   //
   // entrada e saida ficam FIXAS (preserva pickup direction).
   // ============================================================
 
-  // Rota inicial: entrada + meio (já vem ordenado por longitude se ok.length>=4)
-  // Reorganiza meio por longitude (dependendo do pickup)
   var meioOrd = meio.slice().sort(function (a, b) { return a.lng - b.lng; });
   if (!ascendente) meioOrd.reverse();
 
   var rotaInicial = [entrada].concat(meioOrd).concat([saida]);
-  var rotaOtima = aplicarDoisOpt(rotaInicial);
+
+  // Pega matriz de distâncias reais (com cache)
+  var matriz = await pegarMatrizDistancias(rotaInicial, horarioPartida);
+  if (!matriz) {
+    if (typeof console !== "undefined") console.warn("⚠️ Matrix falhou, usando ordem por longitude");
+    return rotaInicial.concat(falhos);
+  }
+
+  var rotaOtima = aplicarDoisOptComMatriz(rotaInicial, matriz);
 
   if (typeof console !== "undefined") {
-    var custoInicial = custoHaversineRota(rotaInicial);
-    var custoFinal = custoHaversineRota(rotaOtima);
+    var custoInicial = custoComMatriz(rotaInicial, rotaInicial, matriz);
+    var custoFinal = custoComMatriz(rotaOtima, rotaInicial, matriz);
     if (custoFinal < custoInicial - 50) {
-      console.log("🔄 2-opt: " + (custoInicial / 1000).toFixed(2) + "km → " +
+      console.log("🔄 2-opt (km real): " + (custoInicial / 1000).toFixed(2) + "km → " +
         (custoFinal / 1000).toFixed(2) + "km (-" +
         ((custoInicial - custoFinal) / 1000).toFixed(2) + "km)");
+    } else {
+      console.log("🔄 2-opt: ordem inicial já era ótima (" + (custoFinal / 1000).toFixed(2) + "km)");
     }
   }
 
@@ -312,51 +317,180 @@ async function otimizarVan(pontosVan, vetor, horarioPartida) {
 }
 
 // ============================================================
-// HAVERSINE: distância em metros entre duas coordenadas
+// CACHE DE DISTÂNCIAS (em localStorage)
+// Limite: 10k pares com LRU automático.
+// Chave: "lat1,lng1|lat2,lng2" com 5 casas decimais.
 // ============================================================
-function distanciaHaversine(la1, lo1, la2, lo2) {
-  var R = 6371000;
-  var toR = function (x) { return x * Math.PI / 180; };
-  var dLat = toR(la2 - la1), dLng = toR(lo2 - lo1);
-  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-          Math.cos(toR(la1)) * Math.cos(toR(la2)) *
-          Math.sin(dLng / 2) * Math.sin(dLng / 2);
-  return 2 * R * Math.asin(Math.sqrt(a));
+var DIST_CACHE_KEY = "wlc_dist_v1";
+var DIST_CACHE_LIMIT = 10000;
+
+function chaveDistancia(p1, p2) {
+  return p1.lat.toFixed(5) + "," + p1.lng.toFixed(5) + "|" +
+         p2.lat.toFixed(5) + "," + p2.lng.toFixed(5);
 }
 
-function custoHaversineRota(rota) {
+function carregarDistCache() {
+  try {
+    var raw = localStorage.getItem(DIST_CACHE_KEY);
+    if (!raw) return { entries: {}, ordem: [] };
+    var p = JSON.parse(raw);
+    if (!p.entries || !p.ordem) return { entries: {}, ordem: [] };
+    return p;
+  } catch (e) { return { entries: {}, ordem: [] }; }
+}
+
+function salvarDistCache(cache) {
+  try {
+    // Aplica LRU: se passou do limite, remove mais antigos
+    while (cache.ordem.length > DIST_CACHE_LIMIT) {
+      var velho = cache.ordem.shift();
+      delete cache.entries[velho];
+    }
+    localStorage.setItem(DIST_CACHE_KEY, JSON.stringify(cache));
+  } catch (e) {
+    // Se localStorage estourou, descarta metade do cache mais antigo e tenta de novo
+    if (typeof console !== "undefined") console.warn("⚠️ localStorage cheio, descartando metade do cache");
+    var metade = Math.floor(cache.ordem.length / 2);
+    for (var i = 0; i < metade; i++) {
+      var k = cache.ordem.shift();
+      delete cache.entries[k];
+    }
+    try { localStorage.setItem(DIST_CACHE_KEY, JSON.stringify(cache)); } catch (e2) {}
+  }
+}
+
+// Toca a chave no LRU (move pro fim da fila)
+function tocarLRU(cache, chave) {
+  var idx = cache.ordem.indexOf(chave);
+  if (idx >= 0) cache.ordem.splice(idx, 1);
+  cache.ordem.push(chave);
+}
+
+// Pega matriz NxN de distâncias entre todos os pontos.
+// Usa cache pra pares conhecidos, faz UMA chamada Distance Matrix pros pares faltantes.
+// Retorna objeto: matriz[i][j] = { distanceMeters, durationSec } ou null se i===j.
+async function pegarMatrizDistancias(pontos, horarioPartida) {
+  var n = pontos.length;
+  var matriz = [];
+  for (var i = 0; i < n; i++) matriz.push(new Array(n).fill(null));
+  for (var i = 0; i < n; i++) matriz[i][i] = { distanceMeters: 0, durationSec: 0 };
+
+  var cache = carregarDistCache();
+  var pairsFaltantes = [];
+  var indicesFaltantes = [];
+
+  for (var i = 0; i < n; i++) {
+    for (var j = 0; j < n; j++) {
+      if (i === j) continue;
+      var k = chaveDistancia(pontos[i], pontos[j]);
+      if (cache.entries[k]) {
+        matriz[i][j] = cache.entries[k];
+        tocarLRU(cache, k);
+      } else {
+        pairsFaltantes.push([
+          { lat: pontos[i].lat, lng: pontos[i].lng },
+          { lat: pontos[j].lat, lng: pontos[j].lng }
+        ]);
+        indicesFaltantes.push([i, j]);
+      }
+    }
+  }
+
+  if (pairsFaltantes.length > 0) {
+    if (typeof console !== "undefined") {
+      var totalPares = n * (n - 1);
+      var deCache = totalPares - pairsFaltantes.length;
+      console.log("📐 Matrix: " + deCache + "/" + totalPares + " do cache, " + pairsFaltantes.length + " pares novos via API");
+    }
+    try {
+      var resp = await fetch("/api/distance-matrix", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pairs: pairsFaltantes, departureTime: horarioPartida })
+      });
+      if (!resp.ok) {
+        if (typeof console !== "undefined") console.warn("⚠️ Distance Matrix API falhou (HTTP " + resp.status + ")");
+        return null;
+      }
+      var data = await resp.json();
+      if (!data.pairs) {
+        if (typeof console !== "undefined") console.warn("⚠️ Distance Matrix retornou sem pares");
+        return null;
+      }
+      // Preenche matriz e atualiza cache
+      indicesFaltantes.forEach(function (idx, k) {
+        var i = idx[0], j = idx[1];
+        var chaveAPI = pontos[i].lat + "," + pontos[i].lng + "|" + pontos[j].lat + "," + pontos[j].lng;
+        var v = data.pairs[chaveAPI];
+        if (v) {
+          matriz[i][j] = v;
+          var chaveCache = chaveDistancia(pontos[i], pontos[j]);
+          cache.entries[chaveCache] = v;
+          tocarLRU(cache, chaveCache);
+        }
+      });
+      salvarDistCache(cache);
+    } catch (e) {
+      if (typeof console !== "undefined") console.warn("⚠️ Erro Distance Matrix:", e.message);
+      return null;
+    }
+  } else {
+    if (typeof console !== "undefined") console.log("📐 Matrix: 100% do cache (nenhuma chamada API)");
+    salvarDistCache(cache); // salva ordem LRU atualizada
+  }
+
+  // Verifica se algum par ficou null (api falhou pra esse par)
+  for (var i = 0; i < n; i++) {
+    for (var j = 0; j < n; j++) {
+      if (matriz[i][j] === null) {
+        if (typeof console !== "undefined") console.warn("⚠️ Par sem distância:", pontos[i].endereco, "→", pontos[j].endereco);
+        // Fallback: usa Haversine pra esse par específico, multiplicado por 1.4 (fator de via urbana)
+        var d = distanciaHaversine(pontos[i].lat, pontos[i].lng, pontos[j].lat, pontos[j].lng);
+        matriz[i][j] = { distanceMeters: d * 1.4, durationSec: d * 1.4 / 8 }; // ~8 m/s ~30km/h urbano
+      }
+    }
+  }
+
+  return matriz;
+}
+
+// Custo de uma rota usando matriz NxN.
+// Como rota pode ser uma reordenação dos pontos originais, recebe `pontosOriginais`
+// pra mapear cada ponto da rota pro seu índice na matriz.
+function custoComMatriz(rota, pontosOriginais, matriz) {
   var total = 0;
   for (var i = 0; i < rota.length - 1; i++) {
-    total += distanciaHaversine(rota[i].lat, rota[i].lng, rota[i + 1].lat, rota[i + 1].lng);
+    var iA = pontosOriginais.indexOf(rota[i]);
+    var iB = pontosOriginais.indexOf(rota[i + 1]);
+    if (iA < 0 || iB < 0 || !matriz[iA] || !matriz[iA][iB]) {
+      // Fallback Haversine se algum índice não bateu
+      total += distanciaHaversine(rota[i].lat, rota[i].lng, rota[i + 1].lat, rota[i + 1].lng);
+    } else {
+      total += matriz[iA][iB].distanceMeters;
+    }
   }
   return total;
 }
 
-// ============================================================
-// 2-OPT: tenta inverter qualquer subsequência [i..j] do meio.
-// Mantém rota[0] (entrada) e rota[last] (saida) fixos.
-// Itera até não achar mais melhoria. Garante mínimo local.
-// Complexidade: O(n²) por iteração, geralmente converge em 2-5 iter pra n<20
-// ============================================================
-function aplicarDoisOpt(rotaInicial) {
+// 2-opt usando matriz real. Mantém entrada (idx 0) e saída (last) fixos.
+function aplicarDoisOptComMatriz(rotaInicial, matriz) {
   var rota = rotaInicial.slice();
   var n = rota.length;
-  if (n < 4) return rota; // entrada+1 meio+saida ou menos: nada a otimizar
+  if (n < 4) return rota;
+  var pontosOrig = rotaInicial.slice(); // matriz indexa por posição em rotaInicial
 
   var melhorou = true;
   var maxIter = 100;
   while (melhorou && maxIter-- > 0) {
     melhorou = false;
-    var custoAtual = custoHaversineRota(rota);
-    // i e j varrem o MEIO (posições 1 a n-2). j > i.
+    var custoAtual = custoComMatriz(rota, pontosOrig, matriz);
     for (var i = 1; i < n - 2; i++) {
       for (var j = i + 1; j < n - 1; j++) {
-        // Inverte segmento [i..j]
         var nova = rota.slice();
         var rev = nova.slice(i, j + 1).reverse();
         for (var k = 0; k < rev.length; k++) nova[i + k] = rev[k];
-        var custoNovo = custoHaversineRota(nova);
-        if (custoNovo < custoAtual - 0.5) { // tolerância 0.5m pra evitar loops por float
+        var custoNovo = custoComMatriz(nova, pontosOrig, matriz);
+        if (custoNovo < custoAtual - 0.5) {
           rota = nova;
           custoAtual = custoNovo;
           melhorou = true;
@@ -367,6 +501,19 @@ function aplicarDoisOpt(rotaInicial) {
     }
   }
   return rota;
+}
+
+// ============================================================
+// HAVERSINE: usado apenas como fallback raríssimo
+// ============================================================
+function distanciaHaversine(la1, lo1, la2, lo2) {
+  var R = 6371000;
+  var toR = function (x) { return x * Math.PI / 180; };
+  var dLat = toR(la2 - la1), dLng = toR(lo2 - lo1);
+  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos(toR(la1)) * Math.cos(toR(la2)) *
+          Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return 2 * R * Math.asin(Math.sqrt(a));
 }
 
 // ============================================================
@@ -1197,7 +1344,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.7 · 2-opt local</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.8 · Distance Matrix</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1519,7 +1666,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0.7 · 2-opt local em Haversine</span>
+        <span>WeLoveChile · v7.0.8 · Distance Matrix real + cache LRU 10k</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
