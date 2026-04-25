@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from "react";
 import { styles } from "./styles.js";
 
 // ============================================================
-// WeLoveChile Route Dispatcher v7.0.3 (v7.0 + Inversão + Sistema simplificado de 2 pickups)
+// WeLoveChile Route Dispatcher v7.0.5 (v7.0.4 + Performance: DP + Paralelização)
 //
 // MUDANÇA vs v7.0:
 //  - Cada tour pode ter sentido invertido por padrão (configurável)
@@ -490,70 +490,99 @@ function calcularVansNecessarias(totalPax, vansDisponiveis) {
   return sorted.length;
 }
 
+// ============================================================
+// PARTICIONAMENTO CONTÍGUO COM CAPACIDADE via DP
+// dp[k][i] = melhor particionamento dos primeiros i pontos em k fatias
+// Transição: pra cada possível corte j<i, tenta montar última fatia [j,i)
+// Complexidade: O(n² × K) — seguro pra n=100, K=20 (200k operações)
+// ============================================================
 function particionarContiguoViavel(pontosOrd, vansSel) {
   var n = pontosOrd.length;
-  var k = vansSel.length;
-  if (k > n) return null;
+  var K = vansSel.length;
+  if (K > n) return null;
   var pref = prefixSumPax(pontosOrd);
-  var melhor = null;
-  var cortes = new Array(k + 1);
-  cortes[0] = 0; cortes[k] = n;
 
-  function buscar(idx, inicio) {
-    if (idx === k) {
-      var paxs = [];
-      for (var i = 0; i < k; i++) {
-        var p = paxIntervalo(pref, cortes[i], cortes[i + 1]);
-        if (p > vansSel[i].capacidade) return;
-        paxs.push(p);
+  // dp[k][i] = { maxP, minP, cortes } | null
+  var dp = [];
+  for (var k = 0; k <= K; k++) dp.push(new Array(n + 1).fill(null));
+  dp[0][0] = { maxP: -Infinity, minP: Infinity, cortes: [0] };
+
+  for (var kk = 1; kk <= K; kk++) {
+    for (var i = 1; i <= n; i++) {
+      var melhorLocal = null;
+      for (var j = kk - 1; j < i; j++) {
+        if (dp[kk - 1][j] === null) continue;
+        var paxFatia = paxIntervalo(pref, j, i);
+        if (paxFatia > vansSel[kk - 1].capacidade) continue;
+        var novoMax = Math.max(dp[kk - 1][j].maxP, paxFatia);
+        var novoMin = Math.min(dp[kk - 1][j].minP, paxFatia);
+        var dif = novoMax - novoMin;
+        if (melhorLocal === null || dif < melhorLocal.dif) {
+          melhorLocal = {
+            maxP: novoMax, minP: novoMin, dif: dif,
+            cortes: dp[kk - 1][j].cortes.concat([i])
+          };
+        }
       }
-      var dif = Math.max.apply(null, paxs) - Math.min.apply(null, paxs);
-      if (melhor === null || dif < melhor.dif) {
-        melhor = { cortes: cortes.slice(), paxs: paxs.slice(), dif: dif };
-      }
-      return;
+      dp[kk][i] = melhorLocal;
     }
-    var min = Math.max(inicio, cortes[idx - 1] + 1);
-    var max = n - (k - idx);
-    for (var c = min; c <= max; c++) { cortes[idx] = c; buscar(idx + 1, c + 1); }
   }
-  buscar(1, 1);
-  if (!melhor) return null;
+
+  var resultado = dp[K][n];
+  if (!resultado) return null;
 
   var fatias = [];
-  for (var i = 0; i < k; i++) {
+  var paxs = [];
+  for (var ii = 0; ii < K; ii++) {
+    var p = paxIntervalo(pref, resultado.cortes[ii], resultado.cortes[ii + 1]);
+    paxs.push(p);
     fatias.push({
-      van: vansSel[i],
-      pontos: pontosOrd.slice(melhor.cortes[i], melhor.cortes[i + 1]),
-      pax: melhor.paxs[i]
+      van: vansSel[ii],
+      pontos: pontosOrd.slice(resultado.cortes[ii], resultado.cortes[ii + 1]),
+      pax: p
     });
   }
-  return { tipo: "contiguo", fatias: fatias, dif: melhor.dif };
+  return { tipo: "contiguo", fatias: fatias, dif: resultado.dif };
 }
 
-function particionarOtimoSemCap(pontosOrd, k) {
+// ============================================================
+// PARTICIONAMENTO IGNORANDO CAPACIDADE via DP (mesma ideia, sem filtro)
+// ============================================================
+function particionarOtimoSemCap(pontosOrd, K) {
   var n = pontosOrd.length;
+  if (K > n) return null;
   var pref = prefixSumPax(pontosOrd);
-  var melhor = null;
-  var cortes = new Array(k + 1);
-  cortes[0] = 0; cortes[k] = n;
 
-  function buscar(idx, inicio) {
-    if (idx === k) {
-      var paxs = [];
-      for (var i = 0; i < k; i++) paxs.push(paxIntervalo(pref, cortes[i], cortes[i + 1]));
-      var dif = Math.max.apply(null, paxs) - Math.min.apply(null, paxs);
-      if (melhor === null || dif < melhor.dif) {
-        melhor = { cortes: cortes.slice(), paxs: paxs.slice(), dif: dif };
+  var dp = [];
+  for (var k = 0; k <= K; k++) dp.push(new Array(n + 1).fill(null));
+  dp[0][0] = { maxP: -Infinity, minP: Infinity, cortes: [0] };
+
+  for (var kk = 1; kk <= K; kk++) {
+    for (var i = 1; i <= n; i++) {
+      var melhorLocal = null;
+      for (var j = kk - 1; j < i; j++) {
+        if (dp[kk - 1][j] === null) continue;
+        var paxFatia = paxIntervalo(pref, j, i);
+        var novoMax = Math.max(dp[kk - 1][j].maxP, paxFatia);
+        var novoMin = Math.min(dp[kk - 1][j].minP, paxFatia);
+        var dif = novoMax - novoMin;
+        if (melhorLocal === null || dif < melhorLocal.dif) {
+          melhorLocal = {
+            maxP: novoMax, minP: novoMin, dif: dif,
+            cortes: dp[kk - 1][j].cortes.concat([i])
+          };
+        }
       }
-      return;
+      dp[kk][i] = melhorLocal;
     }
-    var min = Math.max(inicio, cortes[idx - 1] + 1);
-    var max = n - (k - idx);
-    for (var c = min; c <= max; c++) { cortes[idx] = c; buscar(idx + 1, c + 1); }
   }
-  buscar(1, 1);
-  return melhor;
+
+  var resultado = dp[K][n];
+  if (!resultado) return null;
+
+  var paxs = [];
+  for (var ii = 0; ii < K; ii++) paxs.push(paxIntervalo(pref, resultado.cortes[ii], resultado.cortes[ii + 1]));
+  return { cortes: resultado.cortes, paxs: paxs, dif: resultado.dif };
 }
 
 function particionarComRelaxamento(pontosOrd, vansSel) {
@@ -622,7 +651,9 @@ function clusterizarPorVans(pontosOrd, vansDisponiveis) {
   var todasIguais = vansSel.every(function (v) { return v.capacidade === vansSel[0].capacidade; });
 
   var melhor = null;
-  if (todasIguais) {
+  if (todasIguais || K > 5) {
+    // Sem permutação: se todas iguais é indiferente; se K>5 as permutações (120+) ficam
+    // caras e geralmente não compensam. Usa ordem decrescente por capacidade direto.
     melhor = particionarContiguoViavel(pontosOrd, vansSel);
   } else {
     var perms = permutacoes(vansSel);
@@ -653,12 +684,25 @@ function permutacoes(arr) {
 // PIPELINE PRINCIPAL V7
 // ============================================================
 async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDisponiveis, onProgress) {
-  var enriquecidos = [];
-  for (var i = 0; i < reservas.length; i++) {
-    if (onProgress) onProgress("Geocodificando " + (i + 1) + "/" + reservas.length + ": " + reservas[i].endereco);
-    var geo = await geocodificar(reservas[i].endereco, cache);
-    enriquecidos.push({ ...reservas[i], ...geo });
-    if (i < reservas.length - 1) await delay(150);
+  // Geocodificação em paralelo por lotes de 10 (respeita quota Google ~50 req/s)
+  var enriquecidos = new Array(reservas.length);
+  var completos = 0;
+  var LOTE = 10;
+  for (var li = 0; li < reservas.length; li += LOTE) {
+    var fim = Math.min(li + LOTE, reservas.length);
+    var promessas = [];
+    for (var i = li; i < fim; i++) {
+      promessas.push((function (idx) {
+        return geocodificar(reservas[idx].endereco, cache).then(function (geo) {
+          enriquecidos[idx] = { ...reservas[idx], ...geo };
+          completos++;
+          if (onProgress) onProgress("Geocodificando " + completos + "/" + reservas.length + "...");
+        });
+      })(i));
+    }
+    await Promise.all(promessas);
+    // Pausa entre lotes pra não saturar quota
+    if (fim < reservas.length) await delay(200);
   }
 
   var ok = enriquecidos.filter(function (r) { return r.lat && r.lng; });
@@ -697,11 +741,8 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
     });
   }
 
-  var fatiasComRota = [];
-  for (var fi = 0; fi < clusterResult.fatias.length; fi++) {
-    var fatia = clusterResult.fatias[fi];
-    if (onProgress) onProgress("Otimizando rota da van " + (fi + 1) + "/" + clusterResult.fatias.length + "...");
-
+  // Processa vans em paralelo (lotes de 5 pra não saturar Google)
+  var processarVan = async function (fatia, vanNum) {
     var otimizados = await otimizarVan(fatia.pontos, vetor, horarioInicio);
 
     var legs = [];
@@ -735,11 +776,29 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
       return { ...r, horario: horarios[i], deslocamentoMin: deslocs[i] };
     });
 
-    fatiasComRota.push({
+    return {
       van: fatia.van,
       reservas: reservasFinais,
       paxClustering: fatia.pax
-    });
+    };
+  };
+
+  var fatiasComRota = new Array(clusterResult.fatias.length);
+  var LOTE_VAN = 5;
+  var vansCompletas = 0;
+  for (var li2 = 0; li2 < clusterResult.fatias.length; li2 += LOTE_VAN) {
+    var fim2 = Math.min(li2 + LOTE_VAN, clusterResult.fatias.length);
+    var promessasVan = [];
+    for (var fi = li2; fi < fim2; fi++) {
+      promessasVan.push((function (idx) {
+        return processarVan(clusterResult.fatias[idx], idx + 1).then(function (res) {
+          fatiasComRota[idx] = res;
+          vansCompletas++;
+          if (onProgress) onProgress("Otimizando vans " + vansCompletas + "/" + clusterResult.fatias.length + "...");
+        });
+      })(fi));
+    }
+    await Promise.all(promessasVan);
   }
 
   if (falhos.length > 0 && fatiasComRota.length > 0) {
@@ -1069,7 +1128,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.4 · Refinamento km</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.5 · Performance</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1382,7 +1441,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0.4 · Refinamento km</span>
+        <span>WeLoveChile · v7.0.5 · Performance (DP + paralelo)</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
