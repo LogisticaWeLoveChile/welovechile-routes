@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from "react";
 import { styles } from "./styles.js";
 
 // ============================================================
-// WeLoveChile Route Dispatcher v7.0.6 (v7.0.5 + Veículos grandes + Split inteligente + Relaxamento avançado)
+// WeLoveChile Route Dispatcher v7.0.7 (v7.0.6 + 2-opt local em Haversine, sem otimização Google)
 //
 // MUDANÇA vs v7.0:
 //  - Cada tour pode ter sentido invertido por padrão (configurável)
@@ -275,121 +275,98 @@ async function otimizarVan(pontosVan, vetor, horarioPartida) {
   }
 
   var meio = ok.filter(function (p) { return p !== entrada && p !== saida; });
-  var pts = [{ lat: entrada.lat, lng: entrada.lng }]
-    .concat(meio.map(function (p) { return { lat: p.lat, lng: p.lng }; }))
-    .concat([{ lat: saida.lat, lng: saida.lng }]);
-
-  var r = await chamarRoutes(pts, horarioPartida, true);
-  if (r.erro) {
-    if (typeof console !== "undefined") console.warn("⚠️ Van falhou otimização, usando fallback por lng:", r.erro);
-    var fallback = porLng;
-    if (!ascendente) fallback = fallback.slice().reverse();
-    return fallback.concat(falhos);
-  }
-
-  var todos = [entrada].concat(meio).concat([saida]);
-  var ordenado = r.ordem.map(function (i) { return todos[i]; });
-
-  // Proteção: se por algum motivo a ordem veio incompleta (faltando pontos)
-  // ou com duplicatas, fazemos merge defensivo com `todos` pra garantir
-  // que todos os pontos originais estejam presentes exatamente uma vez.
-  var presentes = {};
-  var ordenadoLimpo = [];
-  ordenado.forEach(function (p) {
-    if (p && !presentes[p.id]) {
-      presentes[p.id] = true;
-      ordenadoLimpo.push(p);
-    }
-  });
-  // Adiciona qualquer ponto que ficou de fora (bug no Google ou no parse)
-  todos.forEach(function (p) {
-    if (p && !presentes[p.id]) {
-      if (typeof console !== "undefined") console.warn("⚠️ Ponto faltante recuperado:", p.endereco);
-      presentes[p.id] = true;
-      ordenadoLimpo.push(p);
-    }
-  });
 
   // ============================================================
-  // REFINAMENTO KM vs TEMPO (conservador)
-  // Testa trocas de pares adjacentes no meio. Se encontrar variante
-  // com km menor e tempo não piorando mais que 3 min, aceita.
-  // Só roda quando há ≥4 pontos (≥2 intermediários) onde realmente há
-  // trocas possíveis. Custa (n-3) chamadas Google extras no pior caso.
+  // OTIMIZAÇÃO LOCAL VIA 2-OPT em cima de Haversine
+  //
+  // Não confiamos mais no Google pra otimizar a ordem porque ele otimiza
+  // por TEMPO (que com vias expressas vazias às 5am, dá voltas longas).
+  // Em vez disso:
+  //   1. Construímos rota inicial: entrada + meio (ord. por longitude) + saida
+  //   2. Aplicamos 2-opt completo: testa inverter qualquer subsequência [i..j]
+  //      do meio. Aceita se reduz custo Haversine total.
+  //   3. Resultado: ordem geograficamente coerente, sem voltas absurdas.
+  //
+  // entrada e saida ficam FIXAS (preserva pickup direction).
   // ============================================================
-  if (ordenadoLimpo.length >= 4) {
-    var refinamento = await refinarPorKm(ordenadoLimpo, r.legs, horarioPartida);
-    if (refinamento.mudou) {
-      if (typeof console !== "undefined") {
-        console.log("🔧 Refinamento km: trocou [" + refinamento.trocas.join(", ") +
-          "] | Δkm=" + refinamento.deltaKm.toFixed(2) + " Δmin=" + refinamento.deltaMin.toFixed(1));
-      }
-      return refinamento.rota.concat(falhos);
+
+  // Rota inicial: entrada + meio (já vem ordenado por longitude se ok.length>=4)
+  // Reorganiza meio por longitude (dependendo do pickup)
+  var meioOrd = meio.slice().sort(function (a, b) { return a.lng - b.lng; });
+  if (!ascendente) meioOrd.reverse();
+
+  var rotaInicial = [entrada].concat(meioOrd).concat([saida]);
+  var rotaOtima = aplicarDoisOpt(rotaInicial);
+
+  if (typeof console !== "undefined") {
+    var custoInicial = custoHaversineRota(rotaInicial);
+    var custoFinal = custoHaversineRota(rotaOtima);
+    if (custoFinal < custoInicial - 50) {
+      console.log("🔄 2-opt: " + (custoInicial / 1000).toFixed(2) + "km → " +
+        (custoFinal / 1000).toFixed(2) + "km (-" +
+        ((custoInicial - custoFinal) / 1000).toFixed(2) + "km)");
     }
   }
 
-  return ordenadoLimpo.concat(falhos);
+  return rotaOtima.concat(falhos);
 }
 
 // ============================================================
-// REFINAMENTO POR KM: testa trocas de vizinhos no meio
+// HAVERSINE: distância em metros entre duas coordenadas
 // ============================================================
-async function refinarPorKm(rota, legsOriginais, horarioPartida) {
-  var n = rota.length;
-  if (n < 4) return { mudou: false };
+function distanciaHaversine(la1, lo1, la2, lo2) {
+  var R = 6371000;
+  var toR = function (x) { return x * Math.PI / 180; };
+  var dLat = toR(la2 - la1), dLng = toR(lo2 - lo1);
+  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos(toR(la1)) * Math.cos(toR(la2)) *
+          Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
 
-  // Métricas da rota original (tempo e km)
-  var tempoOriginal = (legsOriginais || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
-  var kmOriginal = (legsOriginais || []).reduce(function (s, l) { return s + (l.distanceMeters || 0); }, 0);
-
-  // Se não tem legs original (não veio do Google), busca agora
-  if (!tempoOriginal || !kmOriginal) {
-    var ptsOrig = rota.map(function (p) { return { lat: p.lat, lng: p.lng }; });
-    var rOrig = await chamarRoutes(ptsOrig, horarioPartida, false);
-    if (rOrig.erro) return { mudou: false };
-    tempoOriginal = (rOrig.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
-    kmOriginal = (rOrig.legs || []).reduce(function (s, l) { return s + (l.distanceMeters || 0); }, 0);
+function custoHaversineRota(rota) {
+  var total = 0;
+  for (var i = 0; i < rota.length - 1; i++) {
+    total += distanciaHaversine(rota[i].lat, rota[i].lng, rota[i + 1].lat, rota[i + 1].lng);
   }
+  return total;
+}
 
-  // Testa trocas de vizinhos (i, i+1) para i em [1, n-2) — preserva origem (0) e destino (n-1)
-  var melhorVariante = null;
-  for (var i = 1; i < n - 2; i++) {
-    var variante = rota.slice();
-    var tmp = variante[i];
-    variante[i] = variante[i + 1];
-    variante[i + 1] = tmp;
+// ============================================================
+// 2-OPT: tenta inverter qualquer subsequência [i..j] do meio.
+// Mantém rota[0] (entrada) e rota[last] (saida) fixos.
+// Itera até não achar mais melhoria. Garante mínimo local.
+// Complexidade: O(n²) por iteração, geralmente converge em 2-5 iter pra n<20
+// ============================================================
+function aplicarDoisOpt(rotaInicial) {
+  var rota = rotaInicial.slice();
+  var n = rota.length;
+  if (n < 4) return rota; // entrada+1 meio+saida ou menos: nada a otimizar
 
-    var ptsVar = variante.map(function (p) { return { lat: p.lat, lng: p.lng }; });
-    var rVar = await chamarRoutes(ptsVar, horarioPartida, false);
-    if (rVar.erro) continue;
-
-    var tempoVar = (rVar.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
-    var kmVar = (rVar.legs || []).reduce(function (s, l) { return s + (l.distanceMeters || 0); }, 0);
-
-    var deltaKm = (kmVar - kmOriginal) / 1000; // em km
-    var deltaMin = (tempoVar - tempoOriginal) / 60; // em min
-
-    // Aceita se km menor E tempo não piora mais que 3 min
-    if (deltaKm < -0.1 && deltaMin < 3) {
-      if (!melhorVariante || deltaKm < melhorVariante.deltaKm) {
-        melhorVariante = {
-          rota: variante,
-          trocas: [rota[i].endereco + " ↔ " + rota[i + 1].endereco],
-          deltaKm: deltaKm,
-          deltaMin: deltaMin
-        };
+  var melhorou = true;
+  var maxIter = 100;
+  while (melhorou && maxIter-- > 0) {
+    melhorou = false;
+    var custoAtual = custoHaversineRota(rota);
+    // i e j varrem o MEIO (posições 1 a n-2). j > i.
+    for (var i = 1; i < n - 2; i++) {
+      for (var j = i + 1; j < n - 1; j++) {
+        // Inverte segmento [i..j]
+        var nova = rota.slice();
+        var rev = nova.slice(i, j + 1).reverse();
+        for (var k = 0; k < rev.length; k++) nova[i + k] = rev[k];
+        var custoNovo = custoHaversineRota(nova);
+        if (custoNovo < custoAtual - 0.5) { // tolerância 0.5m pra evitar loops por float
+          rota = nova;
+          custoAtual = custoNovo;
+          melhorou = true;
+          break;
+        }
       }
+      if (melhorou) break;
     }
   }
-
-  if (!melhorVariante) return { mudou: false };
-  return {
-    mudou: true,
-    rota: melhorVariante.rota,
-    trocas: melhorVariante.trocas,
-    deltaKm: melhorVariante.deltaKm,
-    deltaMin: melhorVariante.deltaMin
-  };
+  return rota;
 }
 
 // ============================================================
@@ -1220,7 +1197,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.6 · Veículos grandes + Split</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.7 · 2-opt local</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1542,7 +1519,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0.6 · Veículos grandes + Split + Relaxamento avançado</span>
+        <span>WeLoveChile · v7.0.7 · 2-opt local em Haversine</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
