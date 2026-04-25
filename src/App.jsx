@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from "react";
 import { styles } from "./styles.js";
 
 // ============================================================
-// WeLoveChile Route Dispatcher v7.0.5 (v7.0.4 + Performance: DP + Paralelização)
+// WeLoveChile Route Dispatcher v7.0.6 (v7.0.5 + Veículos grandes + Split inteligente + Relaxamento avançado)
 //
 // MUDANÇA vs v7.0:
 //  - Cada tour pode ter sentido invertido por padrão (configurável)
@@ -39,7 +39,8 @@ var TOURS_DEFAULT = [
 var TIPOS_VAN_DEFAULT = [
   { id: "t6", capacidade: 6 }, { id: "t8", capacidade: 8 }, { id: "t9", capacidade: 9 },
   { id: "t10", capacidade: 10 }, { id: "t15", capacidade: 15 },
-  { id: "t18", capacidade: 18 }, { id: "t19", capacidade: 19 }
+  { id: "t18", capacidade: 18 }, { id: "t19", capacidade: 19 },
+  { id: "t25", capacidade: 25 }, { id: "t33", capacidade: 33 }, { id: "t44", capacidade: 44 }
 ];
 
 // ============================================================
@@ -425,7 +426,8 @@ function parseColagem(texto) {
   return reservas;
 }
 
-function unificarReservas(reservas) {
+function unificarReservas(reservas, capMaiorVan) {
+  // Primeiro unifica todos os endereços iguais
   var mapa = {}, ordem = [];
   reservas.forEach(function (r) {
     var k = chaveCache(r.endereco);
@@ -437,7 +439,41 @@ function unificarReservas(reservas) {
       ordem.push(k);
     }
   });
-  return ordem.map(function (k) { return mapa[k]; });
+
+  // Se cap não foi informada, retorna unificação simples (compatibilidade)
+  if (!capMaiorVan || capMaiorVan <= 0) {
+    return ordem.map(function (k) { return mapa[k]; });
+  }
+
+  // Split: se algum endereço unificado excede a maior van, divide em múltiplas paradas
+  // Cada split é tratado como reserva separada (vai pra vans diferentes)
+  var resultado = [];
+  ordem.forEach(function (k) {
+    var item = mapa[k];
+    if (item.passageiros <= capMaiorVan) {
+      resultado.push(item);
+      return;
+    }
+    // Precisa dividir. Distribui em chunks de até capMaiorVan.
+    var restante = item.passageiros;
+    var parte = 1;
+    var totalPartes = Math.ceil(item.passageiros / capMaiorVan);
+    while (restante > 0) {
+      var pax = Math.min(restante, capMaiorVan);
+      resultado.push({
+        id: item.id + "_split" + parte,
+        endereco: item.endereco,
+        passageiros: pax,
+        origens: parte === 1 ? item.origens : [],
+        splitDe: item.passageiros,
+        splitParte: parte,
+        splitTotal: totalPartes
+      });
+      restante -= pax;
+      parte++;
+    }
+  });
+  return resultado;
 }
 
 // ============================================================
@@ -585,6 +621,10 @@ function particionarOtimoSemCap(pontosOrd, K) {
   return { cortes: resultado.cortes, paxs: paxs, dif: resultado.dif };
 }
 
+// Relaxamento avançado: combina movimentos e trocas entre fatias.
+// Aceita qualquer operação que reduza o EXCESSO TOTAL (soma dos excessos por fatia).
+// Move ponto de A→B mesmo sem folga em B (se reduz excesso global).
+// Troca ponto entre A↔B (útil quando ambas têm excesso).
 function particionarComRelaxamento(pontosOrd, vansSel) {
   var k = vansSel.length;
   var otimo = particionarOtimoSemCap(pontosOrd, k);
@@ -599,41 +639,82 @@ function particionarComRelaxamento(pontosOrd, vansSel) {
     });
   }
 
-  var MAX = 100;
-  for (var iter = 0; iter < MAX; iter++) {
-    var pior = -1, maiorExc = 0;
-    for (var i = 0; i < fatias.length; i++) {
-      var exc = fatias[i].pax - fatias[i].van.capacidade;
-      if (exc > maiorExc) { maiorExc = exc; pior = i; }
-    }
-    if (pior === -1) break;
+  function totalExc() {
+    return fatias.reduce(function (s, f) { return s + Math.max(0, f.pax - f.van.capacidade); }, 0);
+  }
 
-    var melhorMov = null;
-    for (var ip = 0; ip < fatias[pior].pontos.length; ip++) {
-      var ponto = fatias[pior].pontos[ip];
-      for (var j = 0; j < fatias.length; j++) {
-        if (j === pior) continue;
-        var folga = fatias[j].van.capacidade - fatias[j].pax;
-        if (ponto.passageiros > folga) continue;
-        var centroideJ = fatias[j].pontos.reduce(function (s, p) { return s + p.lng; }, 0) / fatias[j].pontos.length;
-        var distorcao = Math.abs(ponto.lng - centroideJ);
-        var penaltVizinho = Math.abs(j - pior) > 1 ? 0.1 : 0;
-        var score = distorcao + penaltVizinho;
-        if (melhorMov === null || score < melhorMov.score) {
-          melhorMov = { de: pior, para: j, idx: ip, ponto: ponto, score: score };
+  var MAX = 500;
+  for (var iter = 0; iter < MAX; iter++) {
+    if (totalExc() === 0) break;
+
+    var melhor = null;
+
+    // 1. MOVE: mover ponto de A pra B
+    for (var a = 0; a < fatias.length; a++) {
+      for (var ia = 0; ia < fatias[a].pontos.length; ia++) {
+        var ponto = fatias[a].pontos[ia];
+        for (var b = 0; b < fatias.length; b++) {
+          if (b === a) continue;
+          var paxANovo = fatias[a].pax - ponto.passageiros;
+          var paxBNovo = fatias[b].pax + ponto.passageiros;
+          var excANovo = Math.max(0, paxANovo - fatias[a].van.capacidade);
+          var excBNovo = Math.max(0, paxBNovo - fatias[b].van.capacidade);
+          var excAAtual = Math.max(0, fatias[a].pax - fatias[a].van.capacidade);
+          var excBAtual = Math.max(0, fatias[b].pax - fatias[b].van.capacidade);
+          var deltaExc = (excANovo + excBNovo) - (excAAtual + excBAtual);
+          if (deltaExc < 0 && (melhor === null || deltaExc < melhor.delta)) {
+            melhor = { tipo: "move", a: a, b: b, ia: ia, ponto: ponto, delta: deltaExc };
+          }
         }
       }
     }
-    if (!melhorMov) return null;
 
-    fatias[melhorMov.de].pontos.splice(melhorMov.idx, 1);
-    fatias[melhorMov.de].pax -= melhorMov.ponto.passageiros;
-    var insertIdx = 0;
-    for (var ii = 0; ii < fatias[melhorMov.para].pontos.length; ii++) {
-      if (fatias[melhorMov.para].pontos[ii].lng < melhorMov.ponto.lng) insertIdx = ii + 1;
+    // 2. TROCA: trocar ponto entre A e B
+    for (var a = 0; a < fatias.length; a++) {
+      for (var b = a + 1; b < fatias.length; b++) {
+        for (var ia = 0; ia < fatias[a].pontos.length; ia++) {
+          for (var ib = 0; ib < fatias[b].pontos.length; ib++) {
+            var pa = fatias[a].pontos[ia];
+            var pb = fatias[b].pontos[ib];
+            if (pa.passageiros === pb.passageiros) continue;
+            var paxANovo = fatias[a].pax - pa.passageiros + pb.passageiros;
+            var paxBNovo = fatias[b].pax - pb.passageiros + pa.passageiros;
+            var excANovo = Math.max(0, paxANovo - fatias[a].van.capacidade);
+            var excBNovo = Math.max(0, paxBNovo - fatias[b].van.capacidade);
+            var excAAtual = Math.max(0, fatias[a].pax - fatias[a].van.capacidade);
+            var excBAtual = Math.max(0, fatias[b].pax - fatias[b].van.capacidade);
+            var deltaExc = (excANovo + excBNovo) - (excAAtual + excBAtual);
+            if (deltaExc < 0 && (melhor === null || deltaExc < melhor.delta)) {
+              melhor = { tipo: "troca", a: a, b: b, ia: ia, ib: ib, pa: pa, pb: pb, delta: deltaExc };
+            }
+          }
+        }
+      }
     }
-    fatias[melhorMov.para].pontos.splice(insertIdx, 0, melhorMov.ponto);
-    fatias[melhorMov.para].pax += melhorMov.ponto.passageiros;
+
+    if (!melhor) break; // Sem operações que reduzam excesso
+
+    // Aplica
+    if (melhor.tipo === "move") {
+      fatias[melhor.a].pontos.splice(melhor.ia, 1);
+      fatias[melhor.a].pax -= melhor.ponto.passageiros;
+      // Insere em posição que mantém ordem por longitude
+      var insertIdx = 0;
+      for (var ii = 0; ii < fatias[melhor.b].pontos.length; ii++) {
+        if (fatias[melhor.b].pontos[ii].lng < melhor.ponto.lng) insertIdx = ii + 1;
+      }
+      fatias[melhor.b].pontos.splice(insertIdx, 0, melhor.ponto);
+      fatias[melhor.b].pax += melhor.ponto.passageiros;
+    } else {
+      // Troca: substitui pelos pontos um do outro, mantendo posição (depois reordenamos por lng)
+      fatias[melhor.a].pontos[melhor.ia] = melhor.pb;
+      fatias[melhor.a].pax = fatias[melhor.a].pax - melhor.pa.passageiros + melhor.pb.passageiros;
+      fatias[melhor.b].pontos[melhor.ib] = melhor.pa;
+      fatias[melhor.b].pax = fatias[melhor.b].pax - melhor.pb.passageiros + melhor.pa.passageiros;
+      // Reordena ambas por lng pra manter consistência
+      fatias[melhor.a].pontos.sort(function (x, y) { return x.lng - y.lng; });
+      fatias[melhor.b].pontos.sort(function (x, y) { return x.lng - y.lng; });
+    }
   }
 
   var viavel = fatias.every(function (f) { return f.pax <= f.van.capacidade; });
@@ -728,9 +809,19 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
   var clusterResult = clusterizarPorVans(ordenados, vansDisponiveis);
 
   if (!clusterResult) {
+    var totalPaxClust = ordenados.reduce(function (s, p) { return s + p.passageiros; }, 0);
+    var capTotalClust = vansDisponiveis.reduce(function (s, v) { return s + v.capacidade; }, 0);
+    var tipoErro;
+    if (totalPaxClust > capTotalClust) {
+      tipoErro = "erro_capacidade"; // realmente falta capacidade
+    } else {
+      tipoErro = "erro_distribuicao"; // cabe matematicamente mas não fica viável
+    }
     return {
       fatiasComRota: [{ van: vansDisponiveis[0], reservas: ordenados.concat(falhos) }],
-      tipoParticao: "erro_capacidade"
+      tipoParticao: tipoErro,
+      totalPax: totalPaxClust,
+      capTotal: capTotalClust
     };
   }
 
@@ -914,7 +1005,8 @@ export default function App() {
     setResultado(null);
 
     try {
-      var unificadas = unificarReservas(reservas);
+      var capMaiorVan = vansExp.reduce(function (m, v) { return Math.max(m, v.capacidade); }, 0);
+      var unificadas = unificarReservas(reservas, capMaiorVan);
       var resultado7 = await processarRotaV7(unificadas, vetorEfetivo, horarioEf, cache, vansExp, setStatusMsg);
 
       var rotasFinais = resultado7.fatiasComRota.map(function (fatia) {
@@ -1128,7 +1220,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.5 · Performance</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.6 · Veículos grandes + Split</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1311,7 +1403,16 @@ export default function App() {
                       background: "rgba(250, 80, 80, 0.1)", border: "1px solid rgba(250, 80, 80, 0.3)",
                       borderRadius: 4, fontSize: 12, color: "#fa5050"
                     }}>
-                      ⚠ Capacidade total insuficiente. Adicione mais vans.
+                      ⚠ Capacidade total insuficiente ({resultado.totalPax} pax / {resultado.capTotal} capacidade). Adicione mais vans.
+                    </div>
+                  )}
+                  {resultado.tipoParticao === "erro_distribuicao" && (
+                    <div style={{
+                      padding: "10px 14px", marginBottom: 12,
+                      background: "rgba(250, 80, 80, 0.1)", border: "1px solid rgba(250, 80, 80, 0.3)",
+                      borderRadius: 4, fontSize: 12, color: "#fa5050"
+                    }}>
+                      ⚠ Capacidade no limite ({resultado.totalPax} pax / {resultado.capTotal} cap). A distribuição geográfica não cabe — adicione mais 1 van (mesmo pequena, 6-10p) pra dar folga.
                     </div>
                   )}
                   {resultado.rotas.length > 1 && <div style={styles.dragHint}>↕ arraste clientes entre rotas</div>}
@@ -1441,7 +1542,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0.5 · Performance (DP + paralelo)</span>
+        <span>WeLoveChile · v7.0.6 · Veículos grandes + Split + Relaxamento avançado</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
