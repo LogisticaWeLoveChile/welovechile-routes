@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from "react";
 import { styles } from "./styles.js";
 
 // ============================================================
-// WeLoveChile Route Dispatcher v7.0.8.1 (v7.0.8 + retry + serialização Matrix pra evitar rate limit)
+// WeLoveChile Route Dispatcher v7.0.3 (v7.0 + Inversão + Sistema simplificado de 2 pickups)
 //
 // MUDANÇA vs v7.0:
 //  - Cada tour pode ter sentido invertido por padrão (configurável)
@@ -39,8 +39,7 @@ var TOURS_DEFAULT = [
 var TIPOS_VAN_DEFAULT = [
   { id: "t6", capacidade: 6 }, { id: "t8", capacidade: 8 }, { id: "t9", capacidade: 9 },
   { id: "t10", capacidade: 10 }, { id: "t15", capacidade: 15 },
-  { id: "t18", capacidade: 18 }, { id: "t19", capacidade: 19 },
-  { id: "t25", capacidade: 25 }, { id: "t33", capacidade: 33 }, { id: "t44", capacidade: 44 }
+  { id: "t18", capacidade: 18 }, { id: "t19", capacidade: 19 }
 ];
 
 // ============================================================
@@ -275,281 +274,121 @@ async function otimizarVan(pontosVan, vetor, horarioPartida) {
   }
 
   var meio = ok.filter(function (p) { return p !== entrada && p !== saida; });
+  var pts = [{ lat: entrada.lat, lng: entrada.lng }]
+    .concat(meio.map(function (p) { return { lat: p.lat, lng: p.lng }; }))
+    .concat([{ lat: saida.lat, lng: saida.lng }]);
 
-  // ============================================================
-  // OTIMIZAÇÃO via 2-OPT em cima de matriz REAL de Distance Matrix
-  //
-  // Antes: 2-opt em Haversine (linha reta) — falha em casos com obstáculos
-  //        (rios, autopistas, mãos únicas) onde linha reta engana.
-  // Agora: pega matriz NxN de km REAIS via Google Distance Matrix, com cache.
-  //        2-opt opera sobre km reais por estrada. Sem chute geométrico.
-  //
-  // entrada e saida ficam FIXAS (preserva pickup direction).
-  // ============================================================
-
-  var meioOrd = meio.slice().sort(function (a, b) { return a.lng - b.lng; });
-  if (!ascendente) meioOrd.reverse();
-
-  var rotaInicial = [entrada].concat(meioOrd).concat([saida]);
-
-  // Pega matriz de distâncias reais (com cache)
-  var matriz = await pegarMatrizDistancias(rotaInicial, horarioPartida);
-  if (!matriz) {
-    if (typeof console !== "undefined") console.warn("⚠️ Matrix falhou, usando ordem por longitude");
-    return rotaInicial.concat(falhos);
+  var r = await chamarRoutes(pts, horarioPartida, true);
+  if (r.erro) {
+    if (typeof console !== "undefined") console.warn("⚠️ Van falhou otimização, usando fallback por lng:", r.erro);
+    var fallback = porLng;
+    if (!ascendente) fallback = fallback.slice().reverse();
+    return fallback.concat(falhos);
   }
 
-  var rotaOtima = aplicarDoisOptComMatriz(rotaInicial, matriz);
+  var todos = [entrada].concat(meio).concat([saida]);
+  var ordenado = r.ordem.map(function (i) { return todos[i]; });
 
-  if (typeof console !== "undefined") {
-    var custoInicial = custoComMatriz(rotaInicial, rotaInicial, matriz);
-    var custoFinal = custoComMatriz(rotaOtima, rotaInicial, matriz);
-    if (custoFinal < custoInicial - 50) {
-      console.log("🔄 2-opt (km real): " + (custoInicial / 1000).toFixed(2) + "km → " +
-        (custoFinal / 1000).toFixed(2) + "km (-" +
-        ((custoInicial - custoFinal) / 1000).toFixed(2) + "km)");
-    } else {
-      console.log("🔄 2-opt: ordem inicial já era ótima (" + (custoFinal / 1000).toFixed(2) + "km)");
+  // Proteção: se por algum motivo a ordem veio incompleta (faltando pontos)
+  // ou com duplicatas, fazemos merge defensivo com `todos` pra garantir
+  // que todos os pontos originais estejam presentes exatamente uma vez.
+  var presentes = {};
+  var ordenadoLimpo = [];
+  ordenado.forEach(function (p) {
+    if (p && !presentes[p.id]) {
+      presentes[p.id] = true;
+      ordenadoLimpo.push(p);
     }
-  }
-
-  return rotaOtima.concat(falhos);
-}
-
-// ============================================================
-// CACHE DE DISTÂNCIAS (em localStorage)
-// Limite: 10k pares com LRU automático.
-// Chave: "lat1,lng1|lat2,lng2" com 5 casas decimais.
-// ============================================================
-var DIST_CACHE_KEY = "wlc_dist_v1";
-var DIST_CACHE_LIMIT = 10000;
-
-// Fila pra serializar chamadas Distance Matrix entre vans paralelas.
-// Evita estourar rate limit do Google (100 elementos/seg padrão).
-// Delay mínimo de 200ms entre chamadas garante folga.
-var DM_FILA = Promise.resolve();
-function enfileirarChamadaDM(fn) {
-  var resultado = DM_FILA.then(async function () {
-    var r = await fn();
-    await new Promise(function (res) { setTimeout(res, 200); });
-    return r;
   });
-  DM_FILA = resultado.catch(function () { /* ignora erro pra não quebrar fila */ });
-  return resultado;
-}
-
-function chaveDistancia(p1, p2) {
-  return p1.lat.toFixed(5) + "," + p1.lng.toFixed(5) + "|" +
-         p2.lat.toFixed(5) + "," + p2.lng.toFixed(5);
-}
-
-function carregarDistCache() {
-  try {
-    var raw = localStorage.getItem(DIST_CACHE_KEY);
-    if (!raw) return { entries: {}, ordem: [] };
-    var p = JSON.parse(raw);
-    if (!p.entries || !p.ordem) return { entries: {}, ordem: [] };
-    return p;
-  } catch (e) { return { entries: {}, ordem: [] }; }
-}
-
-function salvarDistCache(cache) {
-  try {
-    // Aplica LRU: se passou do limite, remove mais antigos
-    while (cache.ordem.length > DIST_CACHE_LIMIT) {
-      var velho = cache.ordem.shift();
-      delete cache.entries[velho];
+  // Adiciona qualquer ponto que ficou de fora (bug no Google ou no parse)
+  todos.forEach(function (p) {
+    if (p && !presentes[p.id]) {
+      if (typeof console !== "undefined") console.warn("⚠️ Ponto faltante recuperado:", p.endereco);
+      presentes[p.id] = true;
+      ordenadoLimpo.push(p);
     }
-    localStorage.setItem(DIST_CACHE_KEY, JSON.stringify(cache));
-  } catch (e) {
-    // Se localStorage estourou, descarta metade do cache mais antigo e tenta de novo
-    if (typeof console !== "undefined") console.warn("⚠️ localStorage cheio, descartando metade do cache");
-    var metade = Math.floor(cache.ordem.length / 2);
-    for (var i = 0; i < metade; i++) {
-      var k = cache.ordem.shift();
-      delete cache.entries[k];
-    }
-    try { localStorage.setItem(DIST_CACHE_KEY, JSON.stringify(cache)); } catch (e2) {}
-  }
-}
+  });
 
-// Toca a chave no LRU (move pro fim da fila)
-function tocarLRU(cache, chave) {
-  var idx = cache.ordem.indexOf(chave);
-  if (idx >= 0) cache.ordem.splice(idx, 1);
-  cache.ordem.push(chave);
-}
-
-// Pega matriz NxN de distâncias entre todos os pontos.
-// Usa cache pra pares conhecidos, faz UMA chamada Distance Matrix pros pares faltantes.
-// Retorna objeto: matriz[i][j] = { distanceMeters, durationSec } ou null se i===j.
-async function pegarMatrizDistancias(pontos, horarioPartida) {
-  var n = pontos.length;
-  var matriz = [];
-  for (var i = 0; i < n; i++) matriz.push(new Array(n).fill(null));
-  for (var i = 0; i < n; i++) matriz[i][i] = { distanceMeters: 0, durationSec: 0 };
-
-  var cache = carregarDistCache();
-  var pairsFaltantes = [];
-  var indicesFaltantes = [];
-
-  for (var i = 0; i < n; i++) {
-    for (var j = 0; j < n; j++) {
-      if (i === j) continue;
-      var k = chaveDistancia(pontos[i], pontos[j]);
-      if (cache.entries[k]) {
-        matriz[i][j] = cache.entries[k];
-        tocarLRU(cache, k);
-      } else {
-        pairsFaltantes.push([
-          { lat: pontos[i].lat, lng: pontos[i].lng },
-          { lat: pontos[j].lat, lng: pontos[j].lng }
-        ]);
-        indicesFaltantes.push([i, j]);
+  // ============================================================
+  // REFINAMENTO KM vs TEMPO (conservador)
+  // Testa trocas de pares adjacentes no meio. Se encontrar variante
+  // com km menor e tempo não piorando mais que 3 min, aceita.
+  // Só roda quando há ≥4 pontos (≥2 intermediários) onde realmente há
+  // trocas possíveis. Custa (n-3) chamadas Google extras no pior caso.
+  // ============================================================
+  if (ordenadoLimpo.length >= 4) {
+    var refinamento = await refinarPorKm(ordenadoLimpo, r.legs, horarioPartida);
+    if (refinamento.mudou) {
+      if (typeof console !== "undefined") {
+        console.log("🔧 Refinamento km: trocou [" + refinamento.trocas.join(", ") +
+          "] | Δkm=" + refinamento.deltaKm.toFixed(2) + " Δmin=" + refinamento.deltaMin.toFixed(1));
       }
+      return refinamento.rota.concat(falhos);
     }
   }
 
-  if (pairsFaltantes.length > 0) {
-    if (typeof console !== "undefined") {
-      var totalPares = n * (n - 1);
-      var deCache = totalPares - pairsFaltantes.length;
-      console.log("📐 Matrix: " + deCache + "/" + totalPares + " do cache, " + pairsFaltantes.length + " pares novos via API");
-    }
-
-    // Retry com backoff: até 3 tentativas com delay crescente
-    // Chamada serializada via fila DM pra evitar rate limit do Google
-    var data = null;
-    var ultimoErro = null;
-    for (var tentativa = 1; tentativa <= 3; tentativa++) {
-      try {
-        var resp = await enfileirarChamadaDM(function () {
-          return fetch("/api/distance-matrix", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ pairs: pairsFaltantes, departureTime: horarioPartida })
-          });
-        });
-        if (resp.ok) {
-          data = await resp.json();
-          break;
-        }
-        var bodyErro = "";
-        try { var je = await resp.json(); bodyErro = je.error || JSON.stringify(je); } catch (e) {}
-        ultimoErro = "HTTP " + resp.status + ": " + bodyErro;
-        if (resp.status >= 500 && tentativa < 3) {
-          if (typeof console !== "undefined") console.warn("⚠️ Matrix tentativa " + tentativa + "/3 falhou (" + ultimoErro + "), retry em " + (tentativa * 500) + "ms");
-          await delay(tentativa * 500);
-          continue;
-        }
-        break;
-      } catch (e) {
-        ultimoErro = e.message;
-        if (tentativa < 3) {
-          await delay(tentativa * 500);
-          continue;
-        }
-      }
-    }
-
-    if (!data || !data.pairs) {
-      if (typeof console !== "undefined") console.warn("⚠️ Distance Matrix falhou após 3 tentativas: " + ultimoErro);
-      return null;
-    }
-
-    // Preenche matriz e atualiza cache
-    indicesFaltantes.forEach(function (idx, k) {
-      var i = idx[0], j = idx[1];
-      var chaveAPI = pontos[i].lat + "," + pontos[i].lng + "|" + pontos[j].lat + "," + pontos[j].lng;
-      var v = data.pairs[chaveAPI];
-      if (v) {
-        matriz[i][j] = v;
-        var chaveCache = chaveDistancia(pontos[i], pontos[j]);
-        cache.entries[chaveCache] = v;
-        tocarLRU(cache, chaveCache);
-      }
-    });
-    salvarDistCache(cache);
-  } else {
-    if (typeof console !== "undefined") console.log("📐 Matrix: 100% do cache (nenhuma chamada API)");
-    salvarDistCache(cache); // salva ordem LRU atualizada
-  }
-
-  // Verifica se algum par ficou null (api falhou pra esse par)
-  for (var i = 0; i < n; i++) {
-    for (var j = 0; j < n; j++) {
-      if (matriz[i][j] === null) {
-        if (typeof console !== "undefined") console.warn("⚠️ Par sem distância:", pontos[i].endereco, "→", pontos[j].endereco);
-        // Fallback: usa Haversine pra esse par específico, multiplicado por 1.4 (fator de via urbana)
-        var d = distanciaHaversine(pontos[i].lat, pontos[i].lng, pontos[j].lat, pontos[j].lng);
-        matriz[i][j] = { distanceMeters: d * 1.4, durationSec: d * 1.4 / 8 }; // ~8 m/s ~30km/h urbano
-      }
-    }
-  }
-
-  return matriz;
+  return ordenadoLimpo.concat(falhos);
 }
 
-// Custo de uma rota usando matriz NxN.
-// Como rota pode ser uma reordenação dos pontos originais, recebe `pontosOriginais`
-// pra mapear cada ponto da rota pro seu índice na matriz.
-function custoComMatriz(rota, pontosOriginais, matriz) {
-  var total = 0;
-  for (var i = 0; i < rota.length - 1; i++) {
-    var iA = pontosOriginais.indexOf(rota[i]);
-    var iB = pontosOriginais.indexOf(rota[i + 1]);
-    if (iA < 0 || iB < 0 || !matriz[iA] || !matriz[iA][iB]) {
-      // Fallback Haversine se algum índice não bateu
-      total += distanciaHaversine(rota[i].lat, rota[i].lng, rota[i + 1].lat, rota[i + 1].lng);
-    } else {
-      total += matriz[iA][iB].distanceMeters;
-    }
-  }
-  return total;
-}
-
-// 2-opt usando matriz real. Mantém entrada (idx 0) e saída (last) fixos.
-function aplicarDoisOptComMatriz(rotaInicial, matriz) {
-  var rota = rotaInicial.slice();
+// ============================================================
+// REFINAMENTO POR KM: testa trocas de vizinhos no meio
+// ============================================================
+async function refinarPorKm(rota, legsOriginais, horarioPartida) {
   var n = rota.length;
-  if (n < 4) return rota;
-  var pontosOrig = rotaInicial.slice(); // matriz indexa por posição em rotaInicial
+  if (n < 4) return { mudou: false };
 
-  var melhorou = true;
-  var maxIter = 100;
-  while (melhorou && maxIter-- > 0) {
-    melhorou = false;
-    var custoAtual = custoComMatriz(rota, pontosOrig, matriz);
-    for (var i = 1; i < n - 2; i++) {
-      for (var j = i + 1; j < n - 1; j++) {
-        var nova = rota.slice();
-        var rev = nova.slice(i, j + 1).reverse();
-        for (var k = 0; k < rev.length; k++) nova[i + k] = rev[k];
-        var custoNovo = custoComMatriz(nova, pontosOrig, matriz);
-        if (custoNovo < custoAtual - 0.5) {
-          rota = nova;
-          custoAtual = custoNovo;
-          melhorou = true;
-          break;
-        }
+  // Métricas da rota original (tempo e km)
+  var tempoOriginal = (legsOriginais || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
+  var kmOriginal = (legsOriginais || []).reduce(function (s, l) { return s + (l.distanceMeters || 0); }, 0);
+
+  // Se não tem legs original (não veio do Google), busca agora
+  if (!tempoOriginal || !kmOriginal) {
+    var ptsOrig = rota.map(function (p) { return { lat: p.lat, lng: p.lng }; });
+    var rOrig = await chamarRoutes(ptsOrig, horarioPartida, false);
+    if (rOrig.erro) return { mudou: false };
+    tempoOriginal = (rOrig.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
+    kmOriginal = (rOrig.legs || []).reduce(function (s, l) { return s + (l.distanceMeters || 0); }, 0);
+  }
+
+  // Testa trocas de vizinhos (i, i+1) para i em [1, n-2) — preserva origem (0) e destino (n-1)
+  var melhorVariante = null;
+  for (var i = 1; i < n - 2; i++) {
+    var variante = rota.slice();
+    var tmp = variante[i];
+    variante[i] = variante[i + 1];
+    variante[i + 1] = tmp;
+
+    var ptsVar = variante.map(function (p) { return { lat: p.lat, lng: p.lng }; });
+    var rVar = await chamarRoutes(ptsVar, horarioPartida, false);
+    if (rVar.erro) continue;
+
+    var tempoVar = (rVar.legs || []).reduce(function (s, l) { return s + (l.durationSec || 0); }, 0);
+    var kmVar = (rVar.legs || []).reduce(function (s, l) { return s + (l.distanceMeters || 0); }, 0);
+
+    var deltaKm = (kmVar - kmOriginal) / 1000; // em km
+    var deltaMin = (tempoVar - tempoOriginal) / 60; // em min
+
+    // Aceita se km menor E tempo não piora mais que 3 min
+    if (deltaKm < -0.1 && deltaMin < 3) {
+      if (!melhorVariante || deltaKm < melhorVariante.deltaKm) {
+        melhorVariante = {
+          rota: variante,
+          trocas: [rota[i].endereco + " ↔ " + rota[i + 1].endereco],
+          deltaKm: deltaKm,
+          deltaMin: deltaMin
+        };
       }
-      if (melhorou) break;
     }
   }
-  return rota;
-}
 
-// ============================================================
-// HAVERSINE: usado apenas como fallback raríssimo
-// ============================================================
-function distanciaHaversine(la1, lo1, la2, lo2) {
-  var R = 6371000;
-  var toR = function (x) { return x * Math.PI / 180; };
-  var dLat = toR(la2 - la1), dLng = toR(lo2 - lo1);
-  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-          Math.cos(toR(la1)) * Math.cos(toR(la2)) *
-          Math.sin(dLng / 2) * Math.sin(dLng / 2);
-  return 2 * R * Math.asin(Math.sqrt(a));
+  if (!melhorVariante) return { mudou: false };
+  return {
+    mudou: true,
+    rota: melhorVariante.rota,
+    trocas: melhorVariante.trocas,
+    deltaKm: melhorVariante.deltaKm,
+    deltaMin: melhorVariante.deltaMin
+  };
 }
 
 // ============================================================
@@ -586,8 +425,7 @@ function parseColagem(texto) {
   return reservas;
 }
 
-function unificarReservas(reservas, capMaiorVan) {
-  // Primeiro unifica todos os endereços iguais
+function unificarReservas(reservas) {
   var mapa = {}, ordem = [];
   reservas.forEach(function (r) {
     var k = chaveCache(r.endereco);
@@ -599,41 +437,7 @@ function unificarReservas(reservas, capMaiorVan) {
       ordem.push(k);
     }
   });
-
-  // Se cap não foi informada, retorna unificação simples (compatibilidade)
-  if (!capMaiorVan || capMaiorVan <= 0) {
-    return ordem.map(function (k) { return mapa[k]; });
-  }
-
-  // Split: se algum endereço unificado excede a maior van, divide em múltiplas paradas
-  // Cada split é tratado como reserva separada (vai pra vans diferentes)
-  var resultado = [];
-  ordem.forEach(function (k) {
-    var item = mapa[k];
-    if (item.passageiros <= capMaiorVan) {
-      resultado.push(item);
-      return;
-    }
-    // Precisa dividir. Distribui em chunks de até capMaiorVan.
-    var restante = item.passageiros;
-    var parte = 1;
-    var totalPartes = Math.ceil(item.passageiros / capMaiorVan);
-    while (restante > 0) {
-      var pax = Math.min(restante, capMaiorVan);
-      resultado.push({
-        id: item.id + "_split" + parte,
-        endereco: item.endereco,
-        passageiros: pax,
-        origens: parte === 1 ? item.origens : [],
-        splitDe: item.passageiros,
-        splitParte: parte,
-        splitTotal: totalPartes
-      });
-      restante -= pax;
-      parte++;
-    }
-  });
-  return resultado;
+  return ordem.map(function (k) { return mapa[k]; });
 }
 
 // ============================================================
@@ -686,105 +490,72 @@ function calcularVansNecessarias(totalPax, vansDisponiveis) {
   return sorted.length;
 }
 
-// ============================================================
-// PARTICIONAMENTO CONTÍGUO COM CAPACIDADE via DP
-// dp[k][i] = melhor particionamento dos primeiros i pontos em k fatias
-// Transição: pra cada possível corte j<i, tenta montar última fatia [j,i)
-// Complexidade: O(n² × K) — seguro pra n=100, K=20 (200k operações)
-// ============================================================
 function particionarContiguoViavel(pontosOrd, vansSel) {
   var n = pontosOrd.length;
-  var K = vansSel.length;
-  if (K > n) return null;
+  var k = vansSel.length;
+  if (k > n) return null;
   var pref = prefixSumPax(pontosOrd);
+  var melhor = null;
+  var cortes = new Array(k + 1);
+  cortes[0] = 0; cortes[k] = n;
 
-  // dp[k][i] = { maxP, minP, cortes } | null
-  var dp = [];
-  for (var k = 0; k <= K; k++) dp.push(new Array(n + 1).fill(null));
-  dp[0][0] = { maxP: -Infinity, minP: Infinity, cortes: [0] };
-
-  for (var kk = 1; kk <= K; kk++) {
-    for (var i = 1; i <= n; i++) {
-      var melhorLocal = null;
-      for (var j = kk - 1; j < i; j++) {
-        if (dp[kk - 1][j] === null) continue;
-        var paxFatia = paxIntervalo(pref, j, i);
-        if (paxFatia > vansSel[kk - 1].capacidade) continue;
-        var novoMax = Math.max(dp[kk - 1][j].maxP, paxFatia);
-        var novoMin = Math.min(dp[kk - 1][j].minP, paxFatia);
-        var dif = novoMax - novoMin;
-        if (melhorLocal === null || dif < melhorLocal.dif) {
-          melhorLocal = {
-            maxP: novoMax, minP: novoMin, dif: dif,
-            cortes: dp[kk - 1][j].cortes.concat([i])
-          };
-        }
+  function buscar(idx, inicio) {
+    if (idx === k) {
+      var paxs = [];
+      for (var i = 0; i < k; i++) {
+        var p = paxIntervalo(pref, cortes[i], cortes[i + 1]);
+        if (p > vansSel[i].capacidade) return;
+        paxs.push(p);
       }
-      dp[kk][i] = melhorLocal;
+      var dif = Math.max.apply(null, paxs) - Math.min.apply(null, paxs);
+      if (melhor === null || dif < melhor.dif) {
+        melhor = { cortes: cortes.slice(), paxs: paxs.slice(), dif: dif };
+      }
+      return;
     }
+    var min = Math.max(inicio, cortes[idx - 1] + 1);
+    var max = n - (k - idx);
+    for (var c = min; c <= max; c++) { cortes[idx] = c; buscar(idx + 1, c + 1); }
   }
-
-  var resultado = dp[K][n];
-  if (!resultado) return null;
+  buscar(1, 1);
+  if (!melhor) return null;
 
   var fatias = [];
-  var paxs = [];
-  for (var ii = 0; ii < K; ii++) {
-    var p = paxIntervalo(pref, resultado.cortes[ii], resultado.cortes[ii + 1]);
-    paxs.push(p);
+  for (var i = 0; i < k; i++) {
     fatias.push({
-      van: vansSel[ii],
-      pontos: pontosOrd.slice(resultado.cortes[ii], resultado.cortes[ii + 1]),
-      pax: p
+      van: vansSel[i],
+      pontos: pontosOrd.slice(melhor.cortes[i], melhor.cortes[i + 1]),
+      pax: melhor.paxs[i]
     });
   }
-  return { tipo: "contiguo", fatias: fatias, dif: resultado.dif };
+  return { tipo: "contiguo", fatias: fatias, dif: melhor.dif };
 }
 
-// ============================================================
-// PARTICIONAMENTO IGNORANDO CAPACIDADE via DP (mesma ideia, sem filtro)
-// ============================================================
-function particionarOtimoSemCap(pontosOrd, K) {
+function particionarOtimoSemCap(pontosOrd, k) {
   var n = pontosOrd.length;
-  if (K > n) return null;
   var pref = prefixSumPax(pontosOrd);
+  var melhor = null;
+  var cortes = new Array(k + 1);
+  cortes[0] = 0; cortes[k] = n;
 
-  var dp = [];
-  for (var k = 0; k <= K; k++) dp.push(new Array(n + 1).fill(null));
-  dp[0][0] = { maxP: -Infinity, minP: Infinity, cortes: [0] };
-
-  for (var kk = 1; kk <= K; kk++) {
-    for (var i = 1; i <= n; i++) {
-      var melhorLocal = null;
-      for (var j = kk - 1; j < i; j++) {
-        if (dp[kk - 1][j] === null) continue;
-        var paxFatia = paxIntervalo(pref, j, i);
-        var novoMax = Math.max(dp[kk - 1][j].maxP, paxFatia);
-        var novoMin = Math.min(dp[kk - 1][j].minP, paxFatia);
-        var dif = novoMax - novoMin;
-        if (melhorLocal === null || dif < melhorLocal.dif) {
-          melhorLocal = {
-            maxP: novoMax, minP: novoMin, dif: dif,
-            cortes: dp[kk - 1][j].cortes.concat([i])
-          };
-        }
+  function buscar(idx, inicio) {
+    if (idx === k) {
+      var paxs = [];
+      for (var i = 0; i < k; i++) paxs.push(paxIntervalo(pref, cortes[i], cortes[i + 1]));
+      var dif = Math.max.apply(null, paxs) - Math.min.apply(null, paxs);
+      if (melhor === null || dif < melhor.dif) {
+        melhor = { cortes: cortes.slice(), paxs: paxs.slice(), dif: dif };
       }
-      dp[kk][i] = melhorLocal;
+      return;
     }
+    var min = Math.max(inicio, cortes[idx - 1] + 1);
+    var max = n - (k - idx);
+    for (var c = min; c <= max; c++) { cortes[idx] = c; buscar(idx + 1, c + 1); }
   }
-
-  var resultado = dp[K][n];
-  if (!resultado) return null;
-
-  var paxs = [];
-  for (var ii = 0; ii < K; ii++) paxs.push(paxIntervalo(pref, resultado.cortes[ii], resultado.cortes[ii + 1]));
-  return { cortes: resultado.cortes, paxs: paxs, dif: resultado.dif };
+  buscar(1, 1);
+  return melhor;
 }
 
-// Relaxamento avançado: combina movimentos e trocas entre fatias.
-// Aceita qualquer operação que reduza o EXCESSO TOTAL (soma dos excessos por fatia).
-// Move ponto de A→B mesmo sem folga em B (se reduz excesso global).
-// Troca ponto entre A↔B (útil quando ambas têm excesso).
 function particionarComRelaxamento(pontosOrd, vansSel) {
   var k = vansSel.length;
   var otimo = particionarOtimoSemCap(pontosOrd, k);
@@ -799,82 +570,41 @@ function particionarComRelaxamento(pontosOrd, vansSel) {
     });
   }
 
-  function totalExc() {
-    return fatias.reduce(function (s, f) { return s + Math.max(0, f.pax - f.van.capacidade); }, 0);
-  }
-
-  var MAX = 500;
+  var MAX = 100;
   for (var iter = 0; iter < MAX; iter++) {
-    if (totalExc() === 0) break;
+    var pior = -1, maiorExc = 0;
+    for (var i = 0; i < fatias.length; i++) {
+      var exc = fatias[i].pax - fatias[i].van.capacidade;
+      if (exc > maiorExc) { maiorExc = exc; pior = i; }
+    }
+    if (pior === -1) break;
 
-    var melhor = null;
-
-    // 1. MOVE: mover ponto de A pra B
-    for (var a = 0; a < fatias.length; a++) {
-      for (var ia = 0; ia < fatias[a].pontos.length; ia++) {
-        var ponto = fatias[a].pontos[ia];
-        for (var b = 0; b < fatias.length; b++) {
-          if (b === a) continue;
-          var paxANovo = fatias[a].pax - ponto.passageiros;
-          var paxBNovo = fatias[b].pax + ponto.passageiros;
-          var excANovo = Math.max(0, paxANovo - fatias[a].van.capacidade);
-          var excBNovo = Math.max(0, paxBNovo - fatias[b].van.capacidade);
-          var excAAtual = Math.max(0, fatias[a].pax - fatias[a].van.capacidade);
-          var excBAtual = Math.max(0, fatias[b].pax - fatias[b].van.capacidade);
-          var deltaExc = (excANovo + excBNovo) - (excAAtual + excBAtual);
-          if (deltaExc < 0 && (melhor === null || deltaExc < melhor.delta)) {
-            melhor = { tipo: "move", a: a, b: b, ia: ia, ponto: ponto, delta: deltaExc };
-          }
+    var melhorMov = null;
+    for (var ip = 0; ip < fatias[pior].pontos.length; ip++) {
+      var ponto = fatias[pior].pontos[ip];
+      for (var j = 0; j < fatias.length; j++) {
+        if (j === pior) continue;
+        var folga = fatias[j].van.capacidade - fatias[j].pax;
+        if (ponto.passageiros > folga) continue;
+        var centroideJ = fatias[j].pontos.reduce(function (s, p) { return s + p.lng; }, 0) / fatias[j].pontos.length;
+        var distorcao = Math.abs(ponto.lng - centroideJ);
+        var penaltVizinho = Math.abs(j - pior) > 1 ? 0.1 : 0;
+        var score = distorcao + penaltVizinho;
+        if (melhorMov === null || score < melhorMov.score) {
+          melhorMov = { de: pior, para: j, idx: ip, ponto: ponto, score: score };
         }
       }
     }
+    if (!melhorMov) return null;
 
-    // 2. TROCA: trocar ponto entre A e B
-    for (var a = 0; a < fatias.length; a++) {
-      for (var b = a + 1; b < fatias.length; b++) {
-        for (var ia = 0; ia < fatias[a].pontos.length; ia++) {
-          for (var ib = 0; ib < fatias[b].pontos.length; ib++) {
-            var pa = fatias[a].pontos[ia];
-            var pb = fatias[b].pontos[ib];
-            if (pa.passageiros === pb.passageiros) continue;
-            var paxANovo = fatias[a].pax - pa.passageiros + pb.passageiros;
-            var paxBNovo = fatias[b].pax - pb.passageiros + pa.passageiros;
-            var excANovo = Math.max(0, paxANovo - fatias[a].van.capacidade);
-            var excBNovo = Math.max(0, paxBNovo - fatias[b].van.capacidade);
-            var excAAtual = Math.max(0, fatias[a].pax - fatias[a].van.capacidade);
-            var excBAtual = Math.max(0, fatias[b].pax - fatias[b].van.capacidade);
-            var deltaExc = (excANovo + excBNovo) - (excAAtual + excBAtual);
-            if (deltaExc < 0 && (melhor === null || deltaExc < melhor.delta)) {
-              melhor = { tipo: "troca", a: a, b: b, ia: ia, ib: ib, pa: pa, pb: pb, delta: deltaExc };
-            }
-          }
-        }
-      }
+    fatias[melhorMov.de].pontos.splice(melhorMov.idx, 1);
+    fatias[melhorMov.de].pax -= melhorMov.ponto.passageiros;
+    var insertIdx = 0;
+    for (var ii = 0; ii < fatias[melhorMov.para].pontos.length; ii++) {
+      if (fatias[melhorMov.para].pontos[ii].lng < melhorMov.ponto.lng) insertIdx = ii + 1;
     }
-
-    if (!melhor) break; // Sem operações que reduzam excesso
-
-    // Aplica
-    if (melhor.tipo === "move") {
-      fatias[melhor.a].pontos.splice(melhor.ia, 1);
-      fatias[melhor.a].pax -= melhor.ponto.passageiros;
-      // Insere em posição que mantém ordem por longitude
-      var insertIdx = 0;
-      for (var ii = 0; ii < fatias[melhor.b].pontos.length; ii++) {
-        if (fatias[melhor.b].pontos[ii].lng < melhor.ponto.lng) insertIdx = ii + 1;
-      }
-      fatias[melhor.b].pontos.splice(insertIdx, 0, melhor.ponto);
-      fatias[melhor.b].pax += melhor.ponto.passageiros;
-    } else {
-      // Troca: substitui pelos pontos um do outro, mantendo posição (depois reordenamos por lng)
-      fatias[melhor.a].pontos[melhor.ia] = melhor.pb;
-      fatias[melhor.a].pax = fatias[melhor.a].pax - melhor.pa.passageiros + melhor.pb.passageiros;
-      fatias[melhor.b].pontos[melhor.ib] = melhor.pa;
-      fatias[melhor.b].pax = fatias[melhor.b].pax - melhor.pb.passageiros + melhor.pa.passageiros;
-      // Reordena ambas por lng pra manter consistência
-      fatias[melhor.a].pontos.sort(function (x, y) { return x.lng - y.lng; });
-      fatias[melhor.b].pontos.sort(function (x, y) { return x.lng - y.lng; });
-    }
+    fatias[melhorMov.para].pontos.splice(insertIdx, 0, melhorMov.ponto);
+    fatias[melhorMov.para].pax += melhorMov.ponto.passageiros;
   }
 
   var viavel = fatias.every(function (f) { return f.pax <= f.van.capacidade; });
@@ -892,9 +622,7 @@ function clusterizarPorVans(pontosOrd, vansDisponiveis) {
   var todasIguais = vansSel.every(function (v) { return v.capacidade === vansSel[0].capacidade; });
 
   var melhor = null;
-  if (todasIguais || K > 5) {
-    // Sem permutação: se todas iguais é indiferente; se K>5 as permutações (120+) ficam
-    // caras e geralmente não compensam. Usa ordem decrescente por capacidade direto.
+  if (todasIguais) {
     melhor = particionarContiguoViavel(pontosOrd, vansSel);
   } else {
     var perms = permutacoes(vansSel);
@@ -925,25 +653,12 @@ function permutacoes(arr) {
 // PIPELINE PRINCIPAL V7
 // ============================================================
 async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDisponiveis, onProgress) {
-  // Geocodificação em paralelo por lotes de 10 (respeita quota Google ~50 req/s)
-  var enriquecidos = new Array(reservas.length);
-  var completos = 0;
-  var LOTE = 10;
-  for (var li = 0; li < reservas.length; li += LOTE) {
-    var fim = Math.min(li + LOTE, reservas.length);
-    var promessas = [];
-    for (var i = li; i < fim; i++) {
-      promessas.push((function (idx) {
-        return geocodificar(reservas[idx].endereco, cache).then(function (geo) {
-          enriquecidos[idx] = { ...reservas[idx], ...geo };
-          completos++;
-          if (onProgress) onProgress("Geocodificando " + completos + "/" + reservas.length + "...");
-        });
-      })(i));
-    }
-    await Promise.all(promessas);
-    // Pausa entre lotes pra não saturar quota
-    if (fim < reservas.length) await delay(200);
+  var enriquecidos = [];
+  for (var i = 0; i < reservas.length; i++) {
+    if (onProgress) onProgress("Geocodificando " + (i + 1) + "/" + reservas.length + ": " + reservas[i].endereco);
+    var geo = await geocodificar(reservas[i].endereco, cache);
+    enriquecidos.push({ ...reservas[i], ...geo });
+    if (i < reservas.length - 1) await delay(150);
   }
 
   var ok = enriquecidos.filter(function (r) { return r.lat && r.lng; });
@@ -969,19 +684,9 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
   var clusterResult = clusterizarPorVans(ordenados, vansDisponiveis);
 
   if (!clusterResult) {
-    var totalPaxClust = ordenados.reduce(function (s, p) { return s + p.passageiros; }, 0);
-    var capTotalClust = vansDisponiveis.reduce(function (s, v) { return s + v.capacidade; }, 0);
-    var tipoErro;
-    if (totalPaxClust > capTotalClust) {
-      tipoErro = "erro_capacidade"; // realmente falta capacidade
-    } else {
-      tipoErro = "erro_distribuicao"; // cabe matematicamente mas não fica viável
-    }
     return {
       fatiasComRota: [{ van: vansDisponiveis[0], reservas: ordenados.concat(falhos) }],
-      tipoParticao: tipoErro,
-      totalPax: totalPaxClust,
-      capTotal: capTotalClust
+      tipoParticao: "erro_capacidade"
     };
   }
 
@@ -992,8 +697,11 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
     });
   }
 
-  // Processa vans em paralelo (lotes de 5 pra não saturar Google)
-  var processarVan = async function (fatia, vanNum) {
+  var fatiasComRota = [];
+  for (var fi = 0; fi < clusterResult.fatias.length; fi++) {
+    var fatia = clusterResult.fatias[fi];
+    if (onProgress) onProgress("Otimizando rota da van " + (fi + 1) + "/" + clusterResult.fatias.length + "...");
+
     var otimizados = await otimizarVan(fatia.pontos, vetor, horarioInicio);
 
     var legs = [];
@@ -1027,29 +735,11 @@ async function processarRotaV7(reservas, vetor, horarioInicio, cache, vansDispon
       return { ...r, horario: horarios[i], deslocamentoMin: deslocs[i] };
     });
 
-    return {
+    fatiasComRota.push({
       van: fatia.van,
       reservas: reservasFinais,
       paxClustering: fatia.pax
-    };
-  };
-
-  var fatiasComRota = new Array(clusterResult.fatias.length);
-  var LOTE_VAN = 5;
-  var vansCompletas = 0;
-  for (var li2 = 0; li2 < clusterResult.fatias.length; li2 += LOTE_VAN) {
-    var fim2 = Math.min(li2 + LOTE_VAN, clusterResult.fatias.length);
-    var promessasVan = [];
-    for (var fi = li2; fi < fim2; fi++) {
-      promessasVan.push((function (idx) {
-        return processarVan(clusterResult.fatias[idx], idx + 1).then(function (res) {
-          fatiasComRota[idx] = res;
-          vansCompletas++;
-          if (onProgress) onProgress("Otimizando vans " + vansCompletas + "/" + clusterResult.fatias.length + "...");
-        });
-      })(fi));
-    }
-    await Promise.all(promessasVan);
+    });
   }
 
   if (falhos.length > 0 && fatiasComRota.length > 0) {
@@ -1165,8 +855,7 @@ export default function App() {
     setResultado(null);
 
     try {
-      var capMaiorVan = vansExp.reduce(function (m, v) { return Math.max(m, v.capacidade); }, 0);
-      var unificadas = unificarReservas(reservas, capMaiorVan);
+      var unificadas = unificarReservas(reservas);
       var resultado7 = await processarRotaV7(unificadas, vetorEfetivo, horarioEf, cache, vansExp, setStatusMsg);
 
       var rotasFinais = resultado7.fatiasComRota.map(function (fatia) {
@@ -1380,7 +1069,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.8.1 · Matrix serializada</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.4 · Refinamento km</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1563,16 +1252,7 @@ export default function App() {
                       background: "rgba(250, 80, 80, 0.1)", border: "1px solid rgba(250, 80, 80, 0.3)",
                       borderRadius: 4, fontSize: 12, color: "#fa5050"
                     }}>
-                      ⚠ Capacidade total insuficiente ({resultado.totalPax} pax / {resultado.capTotal} capacidade). Adicione mais vans.
-                    </div>
-                  )}
-                  {resultado.tipoParticao === "erro_distribuicao" && (
-                    <div style={{
-                      padding: "10px 14px", marginBottom: 12,
-                      background: "rgba(250, 80, 80, 0.1)", border: "1px solid rgba(250, 80, 80, 0.3)",
-                      borderRadius: 4, fontSize: 12, color: "#fa5050"
-                    }}>
-                      ⚠ Capacidade no limite ({resultado.totalPax} pax / {resultado.capTotal} cap). A distribuição geográfica não cabe — adicione mais 1 van (mesmo pequena, 6-10p) pra dar folga.
+                      ⚠ Capacidade total insuficiente. Adicione mais vans.
                     </div>
                   )}
                   {resultado.rotas.length > 1 && <div style={styles.dragHint}>↕ arraste clientes entre rotas</div>}
@@ -1702,7 +1382,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0.8.1 · Matrix serializada + retry</span>
+        <span>WeLoveChile · v7.0.4 · Refinamento km</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
