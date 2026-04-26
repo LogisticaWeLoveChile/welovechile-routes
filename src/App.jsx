@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from "react";
 import { styles } from "./styles.js";
 
 // ============================================================
-// WeLoveChile Route Dispatcher v7.0.8 (v7.0.7 + Distance Matrix real + cache LRU 10k pares)
+// WeLoveChile Route Dispatcher v7.0.8.1 (v7.0.8 + retry + serialização Matrix pra evitar rate limit)
 //
 // MUDANÇA vs v7.0:
 //  - Cada tour pode ter sentido invertido por padrão (configurável)
@@ -324,6 +324,20 @@ async function otimizarVan(pontosVan, vetor, horarioPartida) {
 var DIST_CACHE_KEY = "wlc_dist_v1";
 var DIST_CACHE_LIMIT = 10000;
 
+// Fila pra serializar chamadas Distance Matrix entre vans paralelas.
+// Evita estourar rate limit do Google (100 elementos/seg padrão).
+// Delay mínimo de 200ms entre chamadas garante folga.
+var DM_FILA = Promise.resolve();
+function enfileirarChamadaDM(fn) {
+  var resultado = DM_FILA.then(async function () {
+    var r = await fn();
+    await new Promise(function (res) { setTimeout(res, 200); });
+    return r;
+  });
+  DM_FILA = resultado.catch(function () { /* ignora erro pra não quebrar fila */ });
+  return resultado;
+}
+
 function chaveDistancia(p1, p2) {
   return p1.lat.toFixed(5) + "," + p1.lng.toFixed(5) + "|" +
          p2.lat.toFixed(5) + "," + p2.lng.toFixed(5);
@@ -402,38 +416,60 @@ async function pegarMatrizDistancias(pontos, horarioPartida) {
       var deCache = totalPares - pairsFaltantes.length;
       console.log("📐 Matrix: " + deCache + "/" + totalPares + " do cache, " + pairsFaltantes.length + " pares novos via API");
     }
-    try {
-      var resp = await fetch("/api/distance-matrix", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pairs: pairsFaltantes, departureTime: horarioPartida })
-      });
-      if (!resp.ok) {
-        if (typeof console !== "undefined") console.warn("⚠️ Distance Matrix API falhou (HTTP " + resp.status + ")");
-        return null;
-      }
-      var data = await resp.json();
-      if (!data.pairs) {
-        if (typeof console !== "undefined") console.warn("⚠️ Distance Matrix retornou sem pares");
-        return null;
-      }
-      // Preenche matriz e atualiza cache
-      indicesFaltantes.forEach(function (idx, k) {
-        var i = idx[0], j = idx[1];
-        var chaveAPI = pontos[i].lat + "," + pontos[i].lng + "|" + pontos[j].lat + "," + pontos[j].lng;
-        var v = data.pairs[chaveAPI];
-        if (v) {
-          matriz[i][j] = v;
-          var chaveCache = chaveDistancia(pontos[i], pontos[j]);
-          cache.entries[chaveCache] = v;
-          tocarLRU(cache, chaveCache);
+
+    // Retry com backoff: até 3 tentativas com delay crescente
+    // Chamada serializada via fila DM pra evitar rate limit do Google
+    var data = null;
+    var ultimoErro = null;
+    for (var tentativa = 1; tentativa <= 3; tentativa++) {
+      try {
+        var resp = await enfileirarChamadaDM(function () {
+          return fetch("/api/distance-matrix", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ pairs: pairsFaltantes, departureTime: horarioPartida })
+          });
+        });
+        if (resp.ok) {
+          data = await resp.json();
+          break;
         }
-      });
-      salvarDistCache(cache);
-    } catch (e) {
-      if (typeof console !== "undefined") console.warn("⚠️ Erro Distance Matrix:", e.message);
+        var bodyErro = "";
+        try { var je = await resp.json(); bodyErro = je.error || JSON.stringify(je); } catch (e) {}
+        ultimoErro = "HTTP " + resp.status + ": " + bodyErro;
+        if (resp.status >= 500 && tentativa < 3) {
+          if (typeof console !== "undefined") console.warn("⚠️ Matrix tentativa " + tentativa + "/3 falhou (" + ultimoErro + "), retry em " + (tentativa * 500) + "ms");
+          await delay(tentativa * 500);
+          continue;
+        }
+        break;
+      } catch (e) {
+        ultimoErro = e.message;
+        if (tentativa < 3) {
+          await delay(tentativa * 500);
+          continue;
+        }
+      }
+    }
+
+    if (!data || !data.pairs) {
+      if (typeof console !== "undefined") console.warn("⚠️ Distance Matrix falhou após 3 tentativas: " + ultimoErro);
       return null;
     }
+
+    // Preenche matriz e atualiza cache
+    indicesFaltantes.forEach(function (idx, k) {
+      var i = idx[0], j = idx[1];
+      var chaveAPI = pontos[i].lat + "," + pontos[i].lng + "|" + pontos[j].lat + "," + pontos[j].lng;
+      var v = data.pairs[chaveAPI];
+      if (v) {
+        matriz[i][j] = v;
+        var chaveCache = chaveDistancia(pontos[i], pontos[j]);
+        cache.entries[chaveCache] = v;
+        tocarLRU(cache, chaveCache);
+      }
+    });
+    salvarDistCache(cache);
   } else {
     if (typeof console !== "undefined") console.log("📐 Matrix: 100% do cache (nenhuma chamada API)");
     salvarDistCache(cache); // salva ordem LRU atualizada
@@ -1344,7 +1380,7 @@ export default function App() {
           <div style={styles.logo}>◈</div>
           <div>
             <div style={styles.brand}>WeLoveChile</div>
-            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.8 · Distance Matrix</div>
+            <div style={styles.subBrand}>Route Dispatcher · Santiago · v7.0.8.1 · Matrix serializada</div>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1666,7 +1702,7 @@ export default function App() {
       )}
 
       <footer style={styles.footer}>
-        <span>WeLoveChile · v7.0.8 · Distance Matrix real + cache LRU 10k</span>
+        <span>WeLoveChile · v7.0.8.1 · Matrix serializada + retry</span>
         <span style={styles.fHint}>{Object.keys(cache).length} endereços em cache</span>
       </footer>
     </div>
