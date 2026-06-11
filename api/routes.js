@@ -1,13 +1,16 @@
 // Vercel Serverless Function - Routes API (computeRoutes)
 // Aceita horário de partida (departureTime) para usar trânsito histórico daquele horário.
+// v7.1: repassa o status real do Google (400 ≠ 500) pra o cliente não fazer
+// retry de pedido inválido; valida limite de 25 intermediários; guarda de origem.
+
+import { origemPermitida, aplicarCors } from "./_guard.js";
 
 export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  aplicarCors(req, res, "POST, OPTIONS");
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
+  if (!origemPermitida(req)) return res.status(403).json({ error: "Origem não autorizada" });
 
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "GOOGLE_MAPS_API_KEY não configurada" });
@@ -16,6 +19,11 @@ export default async function handler(req, res) {
 
   if (!points || points.length < 2) {
     return res.status(400).json({ error: "Mínimo 2 pontos" });
+  }
+  // Limite da Routes API: 25 intermediários (27 pontos no total).
+  // O frontend divide em pedaços antes de chamar; isto é a rede de segurança.
+  if (points.length > 27) {
+    return res.status(400).json({ error: "Máximo 27 pontos por chamada (25 intermediários). Divida a rota." });
   }
 
   const origin = points[0];
@@ -69,7 +77,12 @@ export default async function handler(req, res) {
     const data = await r.json();
 
     if (!r.ok || !data.routes?.length) {
-      return res.status(500).json({ error: "Routes API erro", details: data });
+      // Repassa o status do Google: 400/403/429 chegam como tal no cliente,
+      // que só faz retry quando faz sentido (5xx e 429).
+      const status = r.ok ? 502 : (r.status >= 400 && r.status < 600 ? r.status : 502);
+      const msg = data?.error?.message || "Routes API erro";
+      console.error("ROUTES_FAIL", { http: r.status, msg, n_points: points.length, optimize: !!optimize });
+      return res.status(status).json({ error: msg, details: data });
     }
 
     const route = data.routes[0];
